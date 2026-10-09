@@ -6,12 +6,12 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, platform, userInfo } from 'node:os';
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 const DEFAULT_SERVER = 'https://kch-ai-status.kch-lee90.workers.dev';
 const CONTACT = 'lee90@kchglobal.co.kr';
 const IS_WINDOWS = platform() === 'win32';
@@ -162,6 +162,27 @@ function stageOf(input) {
   const key = String(input || '').toLowerCase().replace(/\s+/g, '');
   if (!key) return null;
   return STAGES.find((stage) => stage.value === input || stage.label.replace(/\s+/g, '').toLowerCase() === key || stage.words.includes(key)) || null;
+}
+
+function gitRoot(folder) {
+  try {
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: folder || process.cwd(), stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+/** True when `file` (after following links) is inside `root` (after following links). */
+function insideFolder(root, file) {
+  let realRoot;
+  let realFile;
+  try {
+    realRoot = realpathSync(root);
+    realFile = realpathSync(file);
+  } catch {
+    return false;
+  }
+  const inside = relative(realRoot, realFile);
+  return Boolean(inside) && inside !== '..' && !inside.startsWith(`..${sep}`) && !isAbsolute(inside);
 }
 
 function gitRepo(folder) {
@@ -611,14 +632,19 @@ async function opApply(options) {
   const notListed = staff.filter((row) => row.employee_id !== meRow?.id && !people.some((person) => person.id === row.employee_id));
   const uploads = [];
   const kept = [];
+  // Files must be inside this project's git repository (or the sheet's folder when there is none),
+  // checked on real paths so links cannot point outside (QA 2026-10-09, Kimi + Opus).
+  const root = gitRoot(baseDir);
+  const allowedRoot = root || baseDir;
+  if (!root) plan.push(`참고: 이 문서는 git 저장소 밖에 있습니다. 첨부는 ${baseDir} 안의 파일만 올립니다.`);
+  if (!insideFolder(allowedRoot, sheetPath)) throw new UserError(`${basename(sheetPath)}: 문서 위치를 확인할 수 없습니다.`);
   for (const listed of files) {
     const file = resolve(baseDir, listed);
     const inside = relative(baseDir, file);
-    // Only files inside this folder (QA 2026-10-09): a sheet can never pull in files from elsewhere on the PC.
-    if (!inside || inside.startsWith('..') || isAbsolute(inside)) throw new UserError(`첨부 "${listed}": 이 문서가 있는 폴더 안의 파일만 올릴 수 있습니다. 다른 곳의 파일은 attach 명령으로 따로 올려 주세요.`);
     // Already on the service and not here: keep it as it is.
-    if (!existsSync(file) && existingFiles.some((item) => item.name === basename(file))) { kept.push(basename(file)); continue; }
+    if (!existsSync(file) && existingFiles.some((item) => item.name === basename(file)) && !inside.startsWith(`..${sep}`) && inside !== '..' && !isAbsolute(inside)) { kept.push(basename(file)); continue; }
     checkFile(file);
+    if (!insideFolder(allowedRoot, file)) throw new UserError(`첨부 "${listed}": ${root ? '이 프로젝트 저장소' : '이 문서가 있는 폴더'} 안의 파일만 올릴 수 있습니다 (바로가기·링크로 밖을 가리키는 파일 포함). 다른 곳의 파일은 attach 명령으로 따로 올려 주세요.`);
     const sha = createHash('sha256').update(readFileSync(file)).digest('hex');
     if (existingFiles.find((item) => item.sha256 === sha)) continue;
     const named = existingFiles.find((item) => item.name === basename(file));
