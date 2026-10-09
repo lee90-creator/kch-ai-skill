@@ -8,10 +8,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, platform, userInfo } from 'node:os';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const DEFAULT_SERVER = 'https://kch-ai-status.kch-lee90.workers.dev';
 const CONTACT = 'lee90@kchglobal.co.kr';
 const IS_WINDOWS = platform() === 'win32';
@@ -350,7 +350,7 @@ async function opAttach(options) {
   }
   const profile = await me();
   const project = await requireProject(options, profile);
-  await confirm(`${project.title}: 첨부 ${files.length}개를 올립니다 (${files.map((file) => basename(file)).join(', ')}). 첨부는 전 직원이 볼 수 있습니다.`, options);
+  await confirm(`${project.title}: 첨부 ${files.length}개를 올립니다.\n${files.map((file) => `  ${file}`).join('\n')}\n첨부는 전 직원이 볼 수 있습니다.`, options);
   for (const file of files) {
     const bytes = readFileSync(file);
     const name = basename(file);
@@ -610,15 +610,31 @@ async function opApply(options) {
   }
   const notListed = staff.filter((row) => row.employee_id !== meRow?.id && !people.some((person) => person.id === row.employee_id));
   const uploads = [];
-  for (const file of [...files.map((name) => resolve(baseDir, name)), sheetPath]) {
+  const kept = [];
+  for (const listed of files) {
+    const file = resolve(baseDir, listed);
+    const inside = relative(baseDir, file);
+    // Only files inside this folder (QA 2026-10-09): a sheet can never pull in files from elsewhere on the PC.
+    if (!inside || inside.startsWith('..') || isAbsolute(inside)) throw new UserError(`첨부 "${listed}": 이 문서가 있는 폴더 안의 파일만 올릴 수 있습니다. 다른 곳의 파일은 attach 명령으로 따로 올려 주세요.`);
+    // Already on the service and not here: keep it as it is.
+    if (!existsSync(file) && existingFiles.some((item) => item.name === basename(file))) { kept.push(basename(file)); continue; }
     checkFile(file);
     const sha = createHash('sha256').update(readFileSync(file)).digest('hex');
-    const same = existingFiles.find((item) => item.sha256 === sha);
-    if (same) continue;
+    if (existingFiles.find((item) => item.sha256 === sha)) continue;
     const named = existingFiles.find((item) => item.name === basename(file));
     uploads.push({ file, existing: named || null });
-    plan.push(`${named ? '첨부 새 버전' : '첨부 추가'}: ${basename(file)}${file === sheetPath ? ' (이 정리 문서)' : ''}`);
+    plan.push(`${named ? '첨부 새 버전' : '첨부 추가'}: ${inside.split('\\').join('/')}`);
   }
+  {
+    checkFile(sheetPath);
+    const sha = createHash('sha256').update(readFileSync(sheetPath)).digest('hex');
+    if (!existingFiles.find((item) => item.sha256 === sha)) {
+      const named = existingFiles.find((item) => item.name === basename(sheetPath));
+      uploads.push({ file: sheetPath, existing: named || null });
+      plan.push(`${named ? '첨부 새 버전' : '첨부 추가'}: ${basename(sheetPath)} (이 정리 문서)`);
+    }
+  }
+  if (kept.length) plan.push(`참고: ${kept.join(', ')} 은(는) 이미 올라가 있어 그대로 둡니다.`);
   if (!plan.filter((line) => !line.startsWith('참고')).length) {
     return `${title}: 문서와 현황관리 내용이 이미 같습니다. 바꿀 것이 없습니다.${notListed.length ? `\n참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다. 빼려면 웹에서 하세요.` : ''}`;
   }
