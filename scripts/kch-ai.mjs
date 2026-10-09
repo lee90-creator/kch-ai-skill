@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.1.1';
+const VERSION = '1.2.0';
 const DEFAULT_SERVER = 'https://kch-ai-status.kch-lee90.workers.dev';
 const CONTACT = 'lee90@kchglobal.co.kr';
 const IS_WINDOWS = platform() === 'win32';
@@ -390,10 +390,291 @@ async function opUndo(options) {
   return `${last.title}: 마지막 변경을 되돌렸습니다.`;
 }
 
+/* ---------------- project sheet (kch-ai-project.md): write it, review it, apply it ---------------- */
+
+const SHEET_NAME = 'kch-ai-project.md';
+const ROLES = [
+  { value: 'planning', label: '기획', words: ['기획', 'planning', 'pm'] },
+  { value: 'development', label: '개발', words: ['개발', 'development', 'dev', '개발자'] },
+  { value: 'qa', label: 'QA', words: ['qa', '테스트', '검증'] },
+  { value: 'business', label: '현업 담당', words: ['현업담당', '현업', 'business', '업무담당'] },
+  { value: 'operations', label: '운영', words: ['운영', 'operations', 'ops'] },
+];
+const roleLabel = (value) => ROLES.find((role) => role.value === value)?.label || value;
+function parseRoles(text, where) {
+  const parts = String(text || '').split(/[,·/、]|\s및\s/).map((part) => part.trim()).filter(Boolean);
+  const roles = [];
+  for (const part of parts) {
+    const key = part.toLowerCase().replace(/\s+/g, '');
+    const role = ROLES.find((item) => item.words.includes(key) || item.label.replace(/\s+/g, '').toLowerCase() === key);
+    if (!role) throw new UserError(`${where}: "${part}"는 역할이 아닙니다. 기획 / 개발 / QA / 현업 담당 / 운영 중에서 적어 주세요.`);
+    if (!roles.includes(role.value)) roles.push(role.value);
+  }
+  return roles;
+}
+
+const SHEET_SECTIONS = [
+  { key: 'after', match: /한\s*문장|어떤 일/, title: '어떤 일을 편하게 하나요 (한 문장, 필수)' },
+  { key: 'now', match: /예전/, title: '예전에는 어떻게 했나요' },
+  { key: 'progress_text', match: /지금|제한/, title: '지금 되는 부분이나 제한' },
+  { key: 'future_text', match: /앞으로/, title: '앞으로 할 일' },
+  { key: 'people', match: /함께|담당자|참여자/, title: '함께 하는 사람' },
+  { key: 'files', match: /첨부/, title: '첨부' },
+  { key: 'notes', match: /참고|메모|상세/, title: '참고 (현황관리 입력칸에는 들어가지 않고, 이 문서 첨부로만 공유)' },
+];
+
+function renderSheet(data) {
+  const lines = [
+    `# ${data.title || '프로젝트 이름'}`,
+    '',
+    `- 진행 상태: ${data.stage_label || '개발 중'}`,
+    `- 내 역할: ${(data.my_roles || []).map(roleLabel).join(', ')}`,
+    '',
+  ];
+  for (const section of SHEET_SECTIONS) {
+    lines.push(`## ${section.title}`, '');
+    if (section.key === 'people') for (const person of data.people || []) lines.push(`- ${person.name} (${person.department}): ${person.roles.map(roleLabel).join(', ')}`);
+    else if (section.key === 'files') for (const file of data.files || []) lines.push(`- ${file}`);
+    else if (data[section.key]) lines.push(data[section.key]);
+    lines.push('');
+  }
+  lines.push('<!-- kch-ai 스킬이 이 문서를 기준으로 KCH AI 현황관리에 반영합니다. 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료. 역할: 기획 / 개발 / QA / 현업 담당 / 운영. 첨부 경로는 이 문서 기준. 비밀번호·키·개인정보 금지. -->');
+  return `${lines.join('\n')}\n`;
+}
+
+function parseSheet(text) {
+  const sheet = { title: '', stage: null, my_roles: null, fields: {}, people: [], files: [], notes: '' };
+  let section = null;
+  const buffer = {};
+  for (const raw of text.replace(/<!--[\s\S]*?-->/g, '').split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (/^#\s+/.test(line) && !sheet.title) { sheet.title = line.replace(/^#\s+/, '').trim(); section = null; continue; }
+    if (/^##\s+/.test(line)) {
+      const heading = line.replace(/^##\s+/, '');
+      section = SHEET_SECTIONS.find((item) => item.match.test(heading))?.key || 'ignored';
+      buffer[section] = buffer[section] || [];
+      continue;
+    }
+    if (!section) {
+      const meta = /^[-*]\s*(진행\s*상태|내\s*역할)\s*[:：]\s*(.*)$/.exec(line.trim());
+      if (meta && /진행/.test(meta[1])) sheet.stage = meta[2].trim();
+      if (meta && /역할/.test(meta[1])) sheet.my_roles = meta[2].trim();
+      continue;
+    }
+    buffer[section].push(line);
+  }
+  const textOf = (key) => (buffer[key] || []).join('\n').trim().replace(/^\(?(없음|비어 있음)\)?$/, '');
+  for (const key of ['after', 'now', 'progress_text', 'future_text']) if (buffer[key]) sheet.fields[key] = textOf(key);
+  sheet.notes = textOf('notes');
+  for (const line of buffer.people || []) {
+    const match = /^[-*]\s*([^(:：]+?)\s*(?:\(([^)]*)\))?\s*(?:[:：]\s*(.*))?$/.exec(line.trim());
+    if (match && match[1].trim()) sheet.people.push({ name: match[1].trim(), department: (match[2] || '').trim(), roles: (match[3] || '').trim() });
+  }
+  for (const line of buffer.files || []) {
+    const match = /^[-*]\s*(.+)$/.exec(line.trim());
+    if (match) sheet.files.push(match[1].replace(/^`|`$/g, '').trim());
+  }
+  return sheet;
+}
+
+async function staffOf(projectId) {
+  const rows = (await authed('GET', `/projects/${encodeURIComponent(projectId)}/staff`)).staff || [];
+  return rows.filter((row) => row.active !== false);
+}
+
+/** Every attachment of the project: { attachmentId, version, name, sha256 }. */
+async function attachmentsOf(projectId) {
+  const assets = (await authed('GET', `/projects/${encodeURIComponent(projectId)}/assets`)).assets || [];
+  const out = [];
+  for (const asset of assets) {
+    if (asset.deleted_at) continue;
+    const files = (await authed('GET', `/assets/${encodeURIComponent(asset.id)}/files`)).attachments || [];
+    for (const file of files) {
+      if (!file.active || file.deleted_at || !file.current) continue;
+      out.push({ assetId: asset.id, attachmentId: file.id, version: file.version, name: file.current.name, sha256: String(file.current.sha256 || '').toLowerCase() });
+    }
+  }
+  return out;
+}
+
+async function uploadFile(project, file, existing) {
+  const bytes = readFileSync(file);
+  const name = basename(file);
+  const mime = MIME_BY_EXT[extname(file).toLowerCase()];
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  let assetId = existing?.assetId;
+  if (!assetId) assetId = (await authed('POST', `/projects/${encodeURIComponent(project.id)}/assets`, { body: { name, room: 'design', client_request_id: randomUUID() } })).asset.id;
+  const reserved = await authed('POST', `/assets/${encodeURIComponent(assetId)}/files/reservations`, {
+    body: { client_request_id: randomUUID(), name, mime_type: mime, size: bytes.byteLength, sha256, ...(existing ? { attachment_id: existing.attachmentId, expected_version: existing.version } : {}) },
+  });
+  const uploadPath = String(reserved.upload_url || '').replace(/^https?:\/\/[^/]+/, '').replace(/^\/api/, '');
+  if (!uploadPath.startsWith('/files/')) throw new UserError('파일 올리기 주소를 받지 못했습니다. 잠시 후 다시 시도해 주세요.');
+  await authed('PUT', uploadPath, { raw: bytes, contentType: mime });
+}
+
+function checkFile(file) {
+  if (!existsSync(file)) throw new UserError(`첨부 파일을 찾을 수 없습니다: ${file}`);
+  const ext = extname(file).toLowerCase();
+  if (!MIME_BY_EXT[ext]) throw new UserError(`${basename(file)}: PDF, PNG, JPG, GIF, MD, TXT, LOG 파일만 올릴 수 있습니다.`);
+  const size = statSync(file).size;
+  if (size <= 0 || size > MAX_FILE_BYTES) throw new UserError(`${basename(file)}: 20MB 이하만 올릴 수 있습니다.`);
+  if (MIME_BY_EXT[ext] === 'text/markdown' && SECRET_PATTERNS.some((pattern) => pattern.test(readFileSync(file, 'utf8')))) {
+    throw new UserError(`${basename(file)}: 비밀번호나 키로 보이는 내용이 있어 올리지 않았습니다.`);
+  }
+}
+
+/** Finds people by name (and department or e-mail when given). One match each, or a clear question. */
+async function resolvePeople(entries, meId) {
+  const resolved = [];
+  for (const entry of entries) {
+    const query = entry.name.includes('@') ? entry.name : entry.name;
+    const found = (await authed('GET', `/staff/search?q=${encodeURIComponent(query)}`)).staff || [];
+    let candidates = found.filter((person) => person.name === entry.name || person.company_email === entry.name.toLowerCase());
+    if (entry.department) candidates = candidates.filter((person) => String(person.department).includes(entry.department) || entry.department.includes(String(person.department)));
+    if (!candidates.length) throw new UserError(`함께 하는 사람 "${entry.name}"${entry.department ? ` (${entry.department})` : ''}을(를) 사내 명부에서 찾지 못했습니다. 이름을 확인하거나 회사 이메일로 적어 주세요.`);
+    if (candidates.length > 1) throw new UserError(`"${entry.name}"이(가) ${candidates.length}명입니다: ${candidates.map((person) => `${person.name} (${person.department}, ${person.company_email})`).join(' / ')}. 본부나 이메일을 적어 구분해 주세요.`);
+    resolved.push({ id: candidates[0].id, name: candidates[0].name, department: candidates[0].department, roles: parseRoles(entry.roles, `함께 하는 사람 ${entry.name}`), me: candidates[0].id === meId });
+  }
+  return resolved;
+}
+
+/** The project as a sheet: what is stored now (or an empty template when there is no project yet). */
+async function opSheet(options) {
+  const profile = await me();
+  const project = await findProject(options, profile);
+  if (!project) return renderSheet({ title: '', stage_label: '개발 중', my_roles: [], people: [], files: [] });
+  const answers = (await authed('GET', `/projects/${encodeURIComponent(project.id)}/profile`)).profile.answers || {};
+  const staff = await staffOf(project.id);
+  const mine = staff.find((row) => row.name === profile.name && row.department === profile.department);
+  const files = (await attachmentsOf(project.id)).map((file) => file.name).filter((name) => name !== SHEET_NAME);
+  return renderSheet({
+    title: project.title,
+    stage_label: project.stage_label,
+    my_roles: mine?.roles || [],
+    after: answers.after, now: answers.now, progress_text: answers.progress_text, future_text: answers.future_text,
+    people: staff.filter((row) => row !== mine).map((row) => ({ name: row.name, department: row.department, roles: row.roles || [] })),
+    files: files.length ? files.map((name) => `${name}  (이미 올라가 있음)`) : [],
+  });
+}
+
+/** Applies kch-ai-project.md: project, 소개서, my roles, people, attachments, and the sheet itself. */
+async function opApply(options) {
+  const sheetPath = resolve(options.folder || process.cwd(), options.file || SHEET_NAME);
+  if (!existsSync(sheetPath)) throw new UserError(`${sheetPath} 가 없습니다. 먼저 sheet 명령으로 틀을 받아 ${SHEET_NAME} 를 만들어 주세요.`);
+  const sheetText = readFileSync(sheetPath, 'utf8');
+  if (SECRET_PATTERNS.some((pattern) => pattern.test(sheetText))) throw new UserError(`${basename(sheetPath)}: 비밀번호나 키로 보이는 내용이 있어 반영하지 않았습니다.`);
+  const sheet = parseSheet(sheetText);
+  const baseDir = dirname(sheetPath);
+  const folderOptions = { ...options, folder: baseDir };
+  const title = checkText(sheet.title, '프로젝트 이름', 100);
+  if (!title || title === '프로젝트 이름') throw new UserError('문서 맨 위 "# 프로젝트 이름"을 채워 주세요.');
+  const stage = stageOf(sheet.stage || '개발 중');
+  if (!stage) throw new UserError(`진행 상태 "${sheet.stage}"를 알 수 없습니다. 계획 중 / 개발 중 / QA 중 / 개발 완료 중 하나로 적어 주세요.`);
+  const fields = PROFILE_FIELDS.filter((field) => sheet.fields[field.key] !== undefined).map((field) => ({ ...field, value: checkText(sheet.fields[field.key], field.label, field.max) }));
+  if (!fields.find((field) => field.key === 'after')?.value) throw new UserError('"어떤 일을 편하게 하나요 (한 문장)" 칸은 꼭 채워 주세요.');
+  const myRoles = sheet.my_roles === null ? null : parseRoles(sheet.my_roles, '내 역할');
+  const files = sheet.files.map((file) => file.replace(/\s+\(이미 올라가 있음\)$/, '')).filter(Boolean);
+  const profile = await me();
+  const meRow = (await authed('GET', `/staff/search?q=${encodeURIComponent(profile.name)}`)).staff?.find((person) => person.name === profile.name && person.department === profile.department);
+  const people = (await resolvePeople(sheet.people, meRow?.id)).filter((person) => !person.me);
+
+  // Which project: --project, this folder's repository, or the same title among my projects.
+  let project = await findProject(folderOptions, profile);
+  if (!project) project = profile.projects.find((item) => item.title.trim().toLowerCase() === title.toLowerCase()) || null;
+  const repo = gitRepo(baseDir);
+
+  const plan = [];
+  let current = null;
+  let staff = [];
+  let existingFiles = [];
+  if (!project) {
+    plan.push(`새 프로젝트 등록: ${title} (${stage.label})`);
+    for (const field of fields) if (field.value) plan.push(`  ${field.label}: ${field.value}`);
+    if (myRoles) plan.push(`  내 역할: ${myRoles.map(roleLabel).join(', ') || '(없음)'}`);
+    if (repo) plan.push(`  저장소 연결: ${repo.url}`);
+  } else {
+    current = (await authed('GET', `/projects/${encodeURIComponent(project.id)}/profile`)).profile;
+    staff = await staffOf(project.id);
+    existingFiles = await attachmentsOf(project.id);
+    if (project.title !== title) plan.push(`참고: 이름은 "${project.title}" 그대로 둡니다 (이름 변경은 웹에서).`);
+    if (project.stage !== stage.value) plan.push(`진행 상태: ${project.stage_label} → ${stage.label}`);
+    for (const field of fields) if (String(current.answers[field.key] || '').trim() !== field.value) plan.push(`${field.label}\n    지금: ${current.answers[field.key] || '(비어 있음)'}\n    새로: ${field.value || '(비움)'}`);
+    const mine = staff.find((row) => row.employee_id === meRow?.id);
+    if (myRoles && mine && JSON.stringify([...(mine.roles || [])].sort()) !== JSON.stringify([...myRoles].sort())) plan.push(`내 역할: ${(mine.roles || []).map(roleLabel).join(', ') || '(없음)'} → ${myRoles.map(roleLabel).join(', ') || '(없음)'}`);
+    if (repo && !project.repo) plan.push(`저장소 연결: ${repo.url}`);
+  }
+  for (const person of people) {
+    const row = staff.find((item) => item.employee_id === person.id);
+    if (!row) plan.push(`함께 하는 사람 추가: ${person.name} (${person.department}) · ${person.roles.map(roleLabel).join(', ') || '역할 없음'}`);
+    else if (JSON.stringify([...(row.roles || [])].sort()) !== JSON.stringify([...person.roles].sort())) plan.push(`역할 변경: ${person.name} ${(row.roles || []).map(roleLabel).join(', ') || '(없음)'} → ${person.roles.map(roleLabel).join(', ') || '(없음)'}`);
+  }
+  const notListed = staff.filter((row) => row.employee_id !== meRow?.id && !people.some((person) => person.id === row.employee_id));
+  const uploads = [];
+  for (const file of [...files.map((name) => resolve(baseDir, name)), sheetPath]) {
+    checkFile(file);
+    const sha = createHash('sha256').update(readFileSync(file)).digest('hex');
+    const same = existingFiles.find((item) => item.sha256 === sha);
+    if (same) continue;
+    const named = existingFiles.find((item) => item.name === basename(file));
+    uploads.push({ file, existing: named || null });
+    plan.push(`${named ? '첨부 새 버전' : '첨부 추가'}: ${basename(file)}${file === sheetPath ? ' (이 정리 문서)' : ''}`);
+  }
+  if (!plan.filter((line) => !line.startsWith('참고')).length) {
+    return `${title}: 문서와 현황관리 내용이 이미 같습니다. 바꿀 것이 없습니다.${notListed.length ? `\n참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다. 빼려면 웹에서 하세요.` : ''}`;
+  }
+  if (notListed.length) plan.push(`참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다 (빼기는 웹에서).`);
+  await confirm(`${basename(sheetPath)} 기준으로 현황관리에 반영합니다.\n- ${plan.join('\n- ')}\n첨부는 전 직원이 볼 수 있습니다.`, options);
+
+  // Apply.
+  if (!project) {
+    const answers = {};
+    for (const field of fields) answers[field.key] = field.value;
+    if (answers.progress_text) answers.progress = 'partial';
+    if (answers.future_text) answers.future = 'yes';
+    const created = await authed('POST', '/projects', {
+      body: { title, current_stage: stage.value, profile: answers, ...(myRoles?.length ? { creator_roles: myRoles } : {}), ...(repo ? { repo_url: repo.url } : {}), client_request_id: randomUUID() },
+    });
+    project = { id: created.project.id, title, url: `${serverUrl()}/projects/${encodeURIComponent(created.project.id)}`, repo: repo ? { owner: repo.owner, repo: repo.repo } : null };
+    staff = await staffOf(project.id);
+  } else {
+    const changed = fields.filter((field) => String(current.answers[field.key] || '').trim() !== field.value);
+    if (changed.length) {
+      const answers = { ...current.answers };
+      for (const field of changed) answers[field.key] = field.value;
+      if (answers.progress_text && !answers.progress) answers.progress = 'partial';
+      if (answers.future_text && !answers.future) answers.future = 'yes';
+      await authed('PUT', `/projects/${encodeURIComponent(project.id)}/profile`, { body: { answers, expected_version: current.version } });
+    }
+    if (project.stage !== stage.value) {
+      const latest = await authed('GET', `/projects/${encodeURIComponent(project.id)}`);
+      await authed('PATCH', `/projects/${encodeURIComponent(project.id)}`, { body: { current_stage: stage.value, expected_version: latest.project.version } });
+    }
+    if (changed.length || project.stage !== stage.value) {
+      remember({ kind: 'profile2', project_id: project.id, title: project.title, fields: changed.map((field) => ({ key: field.key, label: field.label, before: String(current.answers[field.key] || ''), after: field.value })), stage: project.stage !== stage.value ? { before: project.stage, after: stage.value } : null });
+    }
+    if (repo && !project.repo) await authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url: repo.url } });
+    const mine = staff.find((row) => row.employee_id === meRow?.id);
+    if (myRoles && mine && JSON.stringify([...(mine.roles || [])].sort()) !== JSON.stringify([...myRoles].sort())) {
+      await authed('PATCH', `/projects/${encodeURIComponent(project.id)}/staff/${encodeURIComponent(mine.employee_id)}`, { body: { roles: myRoles, expected_version: mine.version } });
+    }
+  }
+  for (const person of people) {
+    const row = staff.find((item) => item.employee_id === person.id);
+    if (!row) await authed('POST', `/projects/${encodeURIComponent(project.id)}/staff`, { body: { employee_id: person.id, roles: person.roles, client_request_id: randomUUID() } });
+    else if (JSON.stringify([...(row.roles || [])].sort()) !== JSON.stringify([...person.roles].sort())) {
+      await authed('PATCH', `/projects/${encodeURIComponent(project.id)}/staff/${encodeURIComponent(person.id)}`, { body: { roles: person.roles, expected_version: row.version } });
+    }
+  }
+  for (const upload of uploads) await uploadFile(project, upload.file, upload.existing);
+  return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}`;
+}
+
 /* ---------------- CLI ---------------- */
 
 const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
 
+  sheet                                 정리 문서(kch-ai-project.md) 틀 또는 지금 내용을 문서 형식으로
+  apply [kch-ai-project.md]             정리 문서 기준으로 등록·업데이트 (소개서·역할·함께 하는 사람·첨부)
   show                                  이 폴더 프로젝트의 지금 내용 (없으면 '아직 없음')
   list                                  내 프로젝트 목록
   new "이름" --stage "개발 중" --sentence "한 문장" [--before ..] [--progress ..] [--next ..]
@@ -408,7 +689,7 @@ const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
   --yes              확인 없이 실행 (AI가 사용자 확인을 받은 뒤 사용)
 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료`;
 
-const VALUE_FLAGS = new Set(['project', 'stage', 'sentence', 'before', 'progress', 'next', 'server', 'folder']);
+const VALUE_FLAGS = new Set(['project', 'stage', 'sentence', 'before', 'progress', 'next', 'server', 'folder', 'file']);
 function parseArgs(argv) {
   const options = { _: [] };
   for (let index = 0; index < argv.length; index += 1) {
@@ -426,7 +707,7 @@ function parseArgs(argv) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const aliases = { sentence: 'profile', status: 'profile', setup: 'login', ls: 'list', 등록: 'new', 업데이트: 'profile', 보기: 'show', 첨부: 'attach', 되돌리기: 'undo' };
+  const aliases = { 정리: 'sheet', 반영: 'apply', sentence: 'profile', status: 'profile', setup: 'login', ls: 'list', 등록: 'new', 업데이트: 'profile', 보기: 'show', 첨부: 'attach', 되돌리기: 'undo' };
   const raw = options._[0] || 'help';
   const command = aliases[raw] || raw;
   const rest = options._.slice(1);
@@ -459,6 +740,10 @@ async function main() {
       return console.log(await opList());
     case 'show':
       return console.log(await opShow(options));
+    case 'sheet':
+      return process.stdout.write(await opSheet(options));
+    case 'apply':
+      return console.log(await opApply({ ...options, file: rest[0] || options.file }));
     case 'new':
       return console.log(await opNew({ ...options, title: rest.join(' ') }));
     case 'profile':
