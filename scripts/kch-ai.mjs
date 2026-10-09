@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const DEFAULT_SERVER = 'https://kch-ai-status.kch-lee90.workers.dev';
 const CONTACT = 'lee90@kchglobal.co.kr';
 const IS_WINDOWS = platform() === 'win32';
@@ -24,7 +24,7 @@ const STAGES = [
   { value: '실운영', label: '개발 완료', words: ['완료', '개발완료', '운영', '실운영', 'done', 'complete', 'completed', 'release'] },
 ];
 const MIME_BY_EXT = { '.md': 'text/markdown', '.txt': 'text/markdown', '.log': 'text/markdown', '.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif' };
-const SECRET_PATTERNS = [/sk-[A-Za-z0-9_-]{12,}/, /AKIA[0-9A-Z]{12,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /(비밀번호|password|passwd|pwd|api[_-]?key|secret|token)\s*[:=]\s*["']?[A-Za-z0-9_\-./+]{8,}/i, /gh[pousr]_[A-Za-z0-9]{20,}/, /AIza[0-9A-Za-z_-]{20,}/, /xox[abpr]-[A-Za-z0-9-]{10,}/];
+const SECRET_PATTERNS = [/sk-[A-Za-z0-9_-]{12,}/, /AKIA[0-9A-Z]{12,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /(비밀번호|password|passwd|pwd|api[_-]?key|secret|token)\s*[:=]\s*["']?[A-Za-z0-9_\-./+]{8,}/i, /gh[pousr]_[A-Za-z0-9]{20,}/, /AIza[0-9A-Za-z_-]{20,}/, /xox[abpr]-[A-Za-z0-9-]{10,}/, /["']?(api[_-]?key|access[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret)["']?\s*[:=]\s*["']?[A-Za-z0-9_\-./+=]{8,}/i, /authorization\s*[:=]\s*["']?(bearer|basic|token)\s+[A-Za-z0-9_\-.=+/]{12,}/i, /\bbearer\s+[A-Za-z0-9_\-.=+/]{20,}/i, /kch(ai|dc)_[A-Za-z0-9_-]{20,}/];
 /** 소개서 fields the skill may write (same limits as the web form). */
 const PROFILE_FIELDS = [
   { key: 'after', flag: 'sentence', label: '어떤 일을 편하게 하나요 (한 문장, 필수)', max: 2000 },
@@ -261,11 +261,13 @@ async function opShow(options) {
   ].join('\n');
 }
 
-async function linkRepo(project, options) {
-  const repo = gitRepo(options.folder);
-  if (!repo || (project.repo && project.repo.owner.toLowerCase() === repo.owner && project.repo.repo.toLowerCase() === repo.repo)) return '';
-  await authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url: repo.url } });
-  return `\n이 폴더의 저장소(${repo.owner}/${repo.repo})를 연결했습니다. 다음부터는 이 폴더에서 자동으로 찾습니다.`;
+/** This folder's repository for a project picked with --project: link only when it has none (never replace). */
+function repoPlan(project, options) {
+  const repo = options.project ? gitRepo(options.folder) : null;
+  if (!repo) return { link: null, note: '' };
+  if (!project.repo) return { link: repo, note: '' };
+  if (project.repo.owner.toLowerCase() === repo.owner && project.repo.repo.toLowerCase() === repo.repo) return { link: null, note: '' };
+  return { link: null, note: `\n참고: 이 프로젝트에는 이미 다른 저장소(${project.repo.owner}/${project.repo.repo})가 연결돼 있어 바꾸지 않았습니다. 바꾸려면 웹 프로젝트 화면에서 하세요.` };
 }
 
 async function opNew(options) {
@@ -302,12 +304,14 @@ async function opProfile(options) {
   const answers = { ...current.answers };
   const changed = updates.filter((field) => String(answers[field.key] || '').trim() !== field.value);
   const stageChanged = Boolean(stage) && project.stage !== stage.value;
-  if (!changed.length && !stageChanged) return `${project.title}: 이미 같은 내용입니다. 바꿀 것이 없습니다.`;
+  const plan = repoPlan(project, options);
+  if (!changed.length && !stageChanged && !plan.link) return `${project.title}: 이미 같은 내용입니다. 바꿀 것이 없습니다.${plan.note}`;
   if (changed.some((field) => field.key === 'after' && !field.value)) throw new UserError('한 문장은 비울 수 없습니다.');
   await confirm([
     `${project.title}: 아래처럼 바꿉니다.`,
     stageChanged ? `  진행 상태: ${project.stage_label} → ${stage.label}` : '',
     ...changed.map((field) => `  ${field.label}\n    지금: ${answers[field.key] || '(비어 있음)'}\n    새로: ${field.value || '(비움)'}`),
+    plan.link ? `  저장소 연결: ${plan.link.url} (이 폴더)` : '',
   ].filter(Boolean).join('\n'), options);
   if (changed.length) {
     for (const field of changed) answers[field.key] = field.value;
@@ -319,10 +323,16 @@ async function opProfile(options) {
     const latest = await authed('GET', `/projects/${encodeURIComponent(project.id)}`);
     await authed('PATCH', `/projects/${encodeURIComponent(project.id)}`, { body: { current_stage: stage.value, expected_version: latest.project.version } });
   }
-  remember({ kind: 'profile', project_id: project.id, title: project.title, before_answers: current.answers, before_stage: stageChanged ? project.stage : null });
-  const linked = options.project ? await linkRepo(project, options) : '';
-  const what = [stageChanged ? '진행 상태' : '', changed.length ? `소개서 ${changed.length}개 항목` : ''].filter(Boolean).join(', ');
-  return `${project.title}: ${what}을(를) 바꿨습니다.${linked}\n${project.url}`;
+  if (changed.length || stageChanged) {
+    remember({
+      kind: 'profile2', project_id: project.id, title: project.title,
+      fields: changed.map((field) => ({ key: field.key, label: field.label, before: String(current.answers[field.key] || ''), after: field.value })),
+      stage: stageChanged ? { before: project.stage, after: stage.value } : null,
+    });
+  }
+  if (plan.link) await authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url: plan.link.url } });
+  const what = [stageChanged ? '진행 상태' : '', changed.length ? `소개서 ${changed.length}개 항목` : '', plan.link ? '저장소 연결' : ''].filter(Boolean).join(', ');
+  return `${project.title}: ${what}을(를) 반영했습니다.${plan.note}\n${project.url}`;
 }
 
 async function opAttach(options) {
@@ -356,16 +366,25 @@ async function opAttach(options) {
   return `${project.title}: 첨부 ${files.length}개를 올렸습니다.\n${project.url}`;
 }
 
+/** Undo only what this computer changed, and only while nobody has changed those values since. */
 async function opUndo(options) {
   const last = readJsonFile(HISTORY_FILE(), null);
-  if (!last || last.kind !== 'profile') throw new UserError('되돌릴 변경이 없습니다. (이 컴퓨터에서 마지막으로 바꾼 1건만 되돌릴 수 있습니다)');
+  if (!last || last.kind !== 'profile2') throw new UserError('되돌릴 변경이 없습니다. (이 컴퓨터에서 마지막으로 바꾼 1건만 되돌릴 수 있습니다)');
   if (Date.now() - Date.parse(last.at) > 24 * 60 * 60 * 1000) throw new UserError('24시간이 지난 변경은 웹에서 고쳐 주세요.');
-  await confirm(`${last.title}: 마지막 변경을 되돌립니다.`, options);
   const current = (await authed('GET', `/projects/${encodeURIComponent(last.project_id)}/profile`)).profile;
-  await authed('PUT', `/projects/${encodeURIComponent(last.project_id)}/profile`, { body: { answers: last.before_answers, expected_version: current.version } });
-  if (last.before_stage) {
-    const latest = await authed('GET', `/projects/${encodeURIComponent(last.project_id)}`);
-    await authed('PATCH', `/projects/${encodeURIComponent(last.project_id)}`, { body: { current_stage: last.before_stage, expected_version: latest.project.version } });
+  const latest = await authed('GET', `/projects/${encodeURIComponent(last.project_id)}`);
+  const moved = last.fields.filter((field) => String(current.answers[field.key] || '').trim() !== field.after);
+  if (moved.length || (last.stage && latest.project.current_stage !== last.stage.after)) {
+    throw new UserError(`${last.title}: 그 뒤에 다른 사람이 ${[...moved.map((field) => field.label), last.stage && latest.project.current_stage !== last.stage.after ? '진행 상태' : ''].filter(Boolean).join(', ')}을(를) 바꿔서 되돌리지 않았습니다. 웹에서 확인해 주세요.`);
+  }
+  await confirm(`${last.title}: 마지막 변경(${[...last.fields.map((field) => field.label), last.stage ? '진행 상태' : ''].filter(Boolean).join(', ')})을 되돌립니다.`, options);
+  if (last.fields.length) {
+    const answers = { ...current.answers };
+    for (const field of last.fields) answers[field.key] = field.before;
+    await authed('PUT', `/projects/${encodeURIComponent(last.project_id)}/profile`, { body: { answers, expected_version: current.version } });
+  }
+  if (last.stage) {
+    await authed('PATCH', `/projects/${encodeURIComponent(last.project_id)}`, { body: { current_stage: last.stage.before, expected_version: latest.project.version } });
   }
   rmSync(HISTORY_FILE(), { force: true });
   return `${last.title}: 마지막 변경을 되돌렸습니다.`;
