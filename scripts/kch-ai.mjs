@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.2.2';
+const VERSION = '1.2.3';
 const DEFAULT_SERVER = 'https://kch-ai-status.kch-lee90.workers.dev';
 const CONTACT = 'lee90@kchglobal.co.kr';
 const IS_WINDOWS = platform() === 'win32';
@@ -503,6 +503,8 @@ async function staffOf(projectId) {
   return rows.filter((row) => row.active !== false);
 }
 
+/** Asset slots with no stored file yet (e.g. a failed upload), by name: reused on retry. */
+const emptyAssets = new Map();
 /** Every attachment of the project: { attachmentId, version, name, sha256 }. */
 async function attachmentsOf(projectId) {
   const assets = (await authed('GET', `/projects/${encodeURIComponent(projectId)}/assets`)).assets || [];
@@ -510,6 +512,7 @@ async function attachmentsOf(projectId) {
   for (const asset of assets) {
     if (asset.deleted_at) continue;
     const files = (await authed('GET', `/assets/${encodeURIComponent(asset.id)}/files`)).attachments || [];
+    if (!files.some((file) => file.active && !file.deleted_at && file.current)) emptyAssets.set(asset.name, asset.id);
     for (const file of files) {
       if (!file.active || file.deleted_at || !file.current) continue;
       out.push({ assetId: asset.id, attachmentId: file.id, version: file.version, name: file.current.name, sha256: String(file.current.sha256 || '').toLowerCase() });
@@ -523,7 +526,7 @@ async function uploadFile(project, file, existing) {
   const name = basename(file);
   const mime = MIME_BY_EXT[extname(file).toLowerCase()];
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  let assetId = existing?.assetId;
+  let assetId = existing?.assetId ?? emptyAssets.get(name);
   if (!assetId) assetId = (await authed('POST', `/projects/${encodeURIComponent(project.id)}/assets`, { body: { name, room: 'design', client_request_id: randomUUID() } })).asset.id;
   const reserved = await authed('POST', `/assets/${encodeURIComponent(assetId)}/files/reservations`, {
     body: { client_request_id: randomUUID(), name, mime_type: mime, size: bytes.byteLength, sha256, ...(existing ? { attachment_id: existing.attachmentId, expected_version: existing.version } : {}) },
@@ -597,7 +600,15 @@ async function opApply(options) {
   const files = sheet.files.map((file) => file.replace(/\s+\(이미 올라가 있음\)$/, '')).filter(Boolean);
   const profile = await me();
   const meRow = (await authed('GET', `/staff/search?q=${encodeURIComponent(profile.name)}`)).staff?.find((person) => person.name === profile.name && person.department === profile.department);
-  const people = (await resolvePeople(sheet.people, meRow?.id)).filter((person) => !person.me);
+  const resolvedPeople = (await resolvePeople(sheet.people, meRow?.id)).filter((person) => !person.me);
+  const people = [];
+  const merged = [];
+  for (const person of resolvedPeople) {
+    const same = people.find((item) => item.id === person.id);
+    if (!same) { people.push({ ...person, roles: [...person.roles] }); continue; }
+    for (const role of person.roles) if (!same.roles.includes(role)) same.roles.push(role);
+    if (!merged.includes(person.name)) merged.push(person.name);
+  }
 
   // Which project: --project, this folder's repository, or the same title among my projects.
   let project = await findProject(folderOptions, profile);
@@ -661,20 +672,33 @@ async function opApply(options) {
     }
   }
   if (kept.length) plan.push(`참고: ${kept.join(', ')} 은(는) 이미 올라가 있어 그대로 둡니다.`);
+  if (merged.length) plan.push(`참고: ${merged.join(', ')} 이(가) 문서에 여러 줄이라 한 줄로 합쳤습니다 (역할도 합침).`);
   if (!plan.filter((line) => !line.startsWith('참고')).length) {
     return `${title}: 문서와 현황관리 내용이 이미 같습니다. 바꿀 것이 없습니다.${notListed.length ? `\n참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다. 빼려면 웹에서 하세요.` : ''}`;
   }
   if (notListed.length) plan.push(`참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다 (빼기는 웹에서).`);
   await confirm(`${basename(sheetPath)} 기준으로 현황관리에 반영합니다.\n- ${plan.join('\n- ')}\n첨부는 전 직원이 볼 수 있습니다.`, options);
 
-  // Apply.
+  // Apply, step by step: a failure reports what is already applied (re-running applies only the rest).
+  const done = [];
+  const step = async (label, run) => {
+    try {
+      await run();
+      done.push(label);
+    } catch (error) {
+      throw new UserError(`${title}: 중간에 멈췄습니다.\n  반영된 것: ${done.join(', ') || '없음'}\n  멈춘 곳: ${label} (${error instanceof Error ? error.message : error})\n같은 명령을 다시 실행하면 남은 것만 반영합니다.`);
+    }
+  };
   if (!project) {
     const answers = {};
     for (const field of fields) answers[field.key] = field.value;
     if (answers.progress_text) answers.progress = 'partial';
     if (answers.future_text) answers.future = 'yes';
-    const created = await authed('POST', '/projects', {
-      body: { title, current_stage: stage.value, profile: answers, ...(myRoles?.length ? { creator_roles: myRoles } : {}), ...(repo ? { repo_url: repo.url } : {}), client_request_id: randomUUID() },
+    let created;
+    await step('새 프로젝트 등록', async () => {
+      created = await authed('POST', '/projects', {
+        body: { title, current_stage: stage.value, profile: answers, ...(myRoles?.length ? { creator_roles: myRoles } : {}), ...(repo ? { repo_url: repo.url } : {}), client_request_id: randomUUID() },
+      });
     });
     project = { id: created.project.id, title, url: `${serverUrl()}/projects/${encodeURIComponent(created.project.id)}`, repo: repo ? { owner: repo.owner, repo: repo.repo } : null };
     staff = await staffOf(project.id);
@@ -685,29 +709,31 @@ async function opApply(options) {
       for (const field of changed) answers[field.key] = field.value;
       if (answers.progress_text && !answers.progress) answers.progress = 'partial';
       if (answers.future_text && !answers.future) answers.future = 'yes';
-      await authed('PUT', `/projects/${encodeURIComponent(project.id)}/profile`, { body: { answers, expected_version: current.version } });
+      await step('소개서', () => authed('PUT', `/projects/${encodeURIComponent(project.id)}/profile`, { body: { answers, expected_version: current.version } }));
     }
     if (project.stage !== stage.value) {
-      const latest = await authed('GET', `/projects/${encodeURIComponent(project.id)}`);
-      await authed('PATCH', `/projects/${encodeURIComponent(project.id)}`, { body: { current_stage: stage.value, expected_version: latest.project.version } });
+      await step('진행 상태', async () => {
+        const latest = await authed('GET', `/projects/${encodeURIComponent(project.id)}`);
+        await authed('PATCH', `/projects/${encodeURIComponent(project.id)}`, { body: { current_stage: stage.value, expected_version: latest.project.version } });
+      });
     }
     if (changed.length || project.stage !== stage.value) {
       remember({ kind: 'profile2', project_id: project.id, title: project.title, fields: changed.map((field) => ({ key: field.key, label: field.label, before: String(current.answers[field.key] || ''), after: field.value })), stage: project.stage !== stage.value ? { before: project.stage, after: stage.value } : null });
     }
-    if (repo && !project.repo) await authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url: repo.url } });
+    if (repo && !project.repo) await step('저장소 연결', () => authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url: repo.url } }));
     const mine = staff.find((row) => row.employee_id === meRow?.id);
     if (myRoles && mine && JSON.stringify([...(mine.roles || [])].sort()) !== JSON.stringify([...myRoles].sort())) {
-      await authed('PATCH', `/projects/${encodeURIComponent(project.id)}/staff/${encodeURIComponent(mine.employee_id)}`, { body: { roles: myRoles, expected_version: mine.version } });
+      await step('내 역할', () => authed('PATCH', `/projects/${encodeURIComponent(project.id)}/staff/${encodeURIComponent(mine.employee_id)}`, { body: { roles: myRoles, expected_version: mine.version } }));
     }
   }
   for (const person of people) {
     const row = staff.find((item) => item.employee_id === person.id);
-    if (!row) await authed('POST', `/projects/${encodeURIComponent(project.id)}/staff`, { body: { employee_id: person.id, roles: person.roles, client_request_id: randomUUID() } });
+    if (!row) await step(`${person.name} 추가`, () => authed('POST', `/projects/${encodeURIComponent(project.id)}/staff`, { body: { employee_id: person.id, roles: person.roles, client_request_id: randomUUID() } }));
     else if (JSON.stringify([...(row.roles || [])].sort()) !== JSON.stringify([...person.roles].sort())) {
-      await authed('PATCH', `/projects/${encodeURIComponent(project.id)}/staff/${encodeURIComponent(person.id)}`, { body: { roles: person.roles, expected_version: row.version } });
+      await step(`${person.name} 역할`, () => authed('PATCH', `/projects/${encodeURIComponent(project.id)}/staff/${encodeURIComponent(person.id)}`, { body: { roles: person.roles, expected_version: row.version } }));
     }
   }
-  for (const upload of uploads) await uploadFile(project, upload.file, upload.existing);
+  for (const upload of uploads) await step(`첨부 ${basename(upload.file)}`, () => uploadFile(project, upload.file, upload.existing));
   return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}`;
 }
 
