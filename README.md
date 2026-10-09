@@ -4,7 +4,7 @@ AI에게 말 한마디로 **KCH AI 현황관리**에 내 프로젝트를 등록�
 
 ## 설치
 
-Codex, Claude Code 등 쓰고 있는 AI에게 이렇게 말하세요.
+Codex, Claude Code 등 쓰고 있는 AI(앱이든 터미널이든)에게 이렇게 말하세요.
 
 > https://github.com/lee90-creator/kch-ai-skill 이 스킬 설치해줘
 
@@ -33,7 +33,7 @@ git clone https://github.com/lee90-creator/kch-ai-skill ~/.claude/skills/kch-ai
 - "QA 들어갔다고 현황관리에 올려줘"
 - "이 스크린샷 현황관리에 첨부해줘"
 
-> 주의: 웹/모바일 Claude 채팅에서는 안 될 가능성이 큽니다. Codex, Claude Code(앱 포함)에서 쓰세요.
+> 주의: 웹/모바일 Claude 채팅에서는 안 될 가능성이 큽니다. Codex, Claude Code(앱·터미널 모두)에서 쓰세요.
 
 처음 한 번은 브라우저에 [허용] 화면이 뜹니다. 누르면 끝입니다. AI는 바꾸기 전에 항상 먼저 보여 주고 물어봅니다.
 
