@@ -1,36 +1,156 @@
-# kch-ai 스킬
+English | [한국어](README.ko.md)
 
-AI에게 말 한마디로 **KCH AI 현황관리**에 내 프로젝트를 등록하고 업데이트합니다.
+<p align="center">
+  <img src="assets/banner.png" alt="kch-ai — Talk to your AI. Your project shows up on the board." width="100%">
+</p>
 
-## 설치
+# kch-ai
 
-Codex, Claude Code 등 쓰고 있는 AI(앱이든 터미널이든)에게 이렇게 말하세요.
+**Register and update your AI projects on KCH AI Status — just by talking to your AI.**
 
-> https://github.com/lee90-creator/kch-ai-skill 이 스킬 설치해줘
+*Don't fill out forms. Just tell your AI.*
 
-한 번만 설치하면 이 PC의 Codex, Claude Code 등 어디서든 쓸 수 있습니다. 업데이트도 같은 말("이 스킬 업데이트해줘")이면 됩니다.
+[Quick Start](#quick-start) • [What It Does](#what-it-does) • [The Project Document](#the-project-document) • [For AI Agents](#for-ai-agents) • [KCH AI Status](https://kch-ai-status.kch-lee90.workers.dev) • [Contact](mailto:lee90@kchglobal.co.kr)
 
-<details>
-<summary>AI가 설치 방법을 모를 때 (AI에게 보여 줄 내용)</summary>
+---
 
-1. 이 저장소를 아무 폴더에나 받습니다 (`git clone https://github.com/lee90-creator/kch-ai-skill` 또는 zip 다운로드 후 압축 풀기).
-2. 받은 폴더에서 `node scripts/install.mjs` 를 실행합니다.
-   - 스킬을 이 PC에 한 벌만 두고(`~/.kch-ai/skill`), Codex(`~/.codex/skills/kch-ai`), Claude Code(`~/.claude/skills/kch-ai`), Aside 가 모두 그 한 벌을 보도록 연결합니다.
-3. AI 앱을 다시 시작합니다. Node.js 18 이상이 필요합니다.
-</details>
+## Quick Start
 
-## 사용
+**Step 1: Install**
 
-프로젝트 폴더에서 AI에게:
+Tell your AI (Codex or Claude Code — app or terminal):
 
-- "kch-ai 스킬로 이 프로젝트 .md 파일 읽고 정리해서 현황관리에 올려줘"
-- "kch-ai 스킬로 현황관리 업데이트해줘. 담당자에 김혜민 QA로 추가해줘"
-- "QA 들어갔다고 현황관리에 올려줘"
-- "이 스크린샷 현황관리에 첨부해줘"
+```
+https://github.com/lee90-creator/kch-ai-skill install this skill
+```
 
-> 주의: 웹/모바일 Claude 채팅에서는 안 될 가능성이 큽니다. Codex, Claude Code(앱·터미널 모두)에서 쓰세요.
+One install covers every AI tool on your PC (Codex, Claude Code, Aside).
 
-AI가 프로젝트를 정리 문서(`kch-ai-project.md`)로 만들어 보여 주고, 확인하면 소개서·담당자·첨부까지 한 번에 올립니다.
-처음 한 번은 브라우저에 [허용] 화면이 뜹니다. 누르면 끝입니다.
+**Step 2: Allow once**
 
-문의: lee90@kchglobal.co.kr
+The first time you use it, a browser page opens. Check that the code matches the one your AI shows, then click **허용 (Allow)**. It won't ask again on that PC.
+
+**Step 3: Talk**
+
+Open your project folder and say:
+
+```
+Use the kch-ai skill to read this project's .md files, write it up, and post it to KCH AI Status.
+```
+
+That's it. Your AI writes a project document, shows you exactly what will change, and posts it after you say yes.
+
+> **Note:** Web / mobile Claude chat will most likely not work. Use Codex or Claude Code (app or terminal).
+
+---
+
+## Why kch-ai?
+
+- **Zero forms** — describe your project in plain words; your AI reads the repo and fills in every field
+- **One document, always** — every change goes through `kch-ai-project.md`, and the document is attached to your project each time
+- **Always asks first** — nothing is posted until you see the full list of changes and say yes
+- **Asks, never guesses** — your role, your teammates, and which files to attach are always confirmed with you
+- **Your projects only** — the skill can touch only projects you take part in
+- **Safe uploads** — files with keys, tokens, or passwords are refused; files outside your repository (including links pointing outside) are refused
+- **Install once, use everywhere** — one copy on your PC, shared by Codex, Claude Code, and Aside
+- **No expiry, easy to revoke** — stays connected until you disconnect it; stops after a year unused
+
+---
+
+## What It Does
+
+| You say | What happens |
+| --- | --- |
+| "Write up this project and post it" | Reads the repo → writes `kch-ai-project.md` → asks your role, teammates, attachments → posts summary, status, roles, teammates, files, and the document itself |
+| "Update it on KCH AI Status" | Compares the document with what's posted and changes only what differs |
+| "We moved to QA" | Edits the status line in the document → posts it |
+| "Add 김혜민 as QA" | Adds a teammate line → finds them in the company directory → posts it |
+| "Attach this screenshot" | Adds the file to the document's attachment list → uploads it with the document |
+| "Undo that" | Reverts this PC's last change (within 24 hours, and only if nobody edited it since) |
+
+Not done by the skill (use the website): removing teammates, deleting attachments, renaming a project.
+
+**Status values:** 계획 중 (planning) / 개발 중 (in development) / QA 중 (trial in real work) / 개발 완료 (in use)
+**Roles:** 기획 (planning) / 개발 (development) / QA / 현업 담당 (business owner) / 운영 (operations)
+
+---
+
+## The Project Document
+
+`kch-ai-project.md` lives at the top of your repository. Your AI writes it; you review it. Commit it, and next time just edit and post again.
+
+```markdown
+# 세금계산서 자동수집 로봇
+
+- 진행 상태: QA 중
+- 내 역할: 기획, 개발
+
+## 어떤 일을 편하게 하나요 (한 문장, 필수)
+직원이 매달 27개 법인 세금계산서를 일일이 받던 일을 자동으로 끝냅니다.
+
+## 예전에는 어떻게 했나요
+## 지금 되는 부분이나 제한
+## 앞으로 할 일
+
+## 함께 하는 사람
+- 김혜민 (경영지원본부): QA, 현업 담당
+
+## 첨부
+- docs/screens/main.png
+
+## 참고
+- 구성 / 기능 흐름 / 사용 방법 / 저장·복구 / 확인한 것 / 주의점
+```
+
+| Section | Posted as |
+| --- | --- |
+| Title, `진행 상태`, `내 역할` | Project name, status, your roles |
+| `어떤 일을 편하게 하나요` (required) | The one-line summary everyone sees |
+| `예전에는…` / `지금 되는…` / `앞으로 할 일` | The optional detail fields |
+| `함께 하는 사람` | Teammates and their roles (`- Name (Division): role, role`) |
+| `첨부` | Files inside the repo to upload (PDF, PNG, JPG, GIF, MD, TXT, LOG, ≤ 20 MB) |
+| `참고` | Not a field — the full write-up, shared as the attached document |
+
+---
+
+## For AI Agents
+
+Full instructions are in [`SKILL.md`](SKILL.md). The tool is `scripts/kch-ai.mjs` (Node.js 18+, no dependencies).
+
+| Command | Purpose |
+| --- | --- |
+| `sheet` | Print the current project as a document (or an empty template) |
+| `apply` | Show the change list and stop (exit code 2) — show it to the user |
+| `apply --yes` | Post the document after the user agreed |
+| `show` / `list` | Read-only: this folder's project / all my projects |
+| `attach <file> --yes` | Upload a file from outside the repo (requires the document; uploads it too) |
+| `undo` | Revert this PC's last change |
+| `login` / `logout` / `whoami` | Connection |
+
+Direct-change commands (`new`, `profile`) are refused on purpose: every change goes through the document.
+
+---
+
+## Updating
+
+Tell your AI:
+
+```
+update the kch-ai skill
+```
+
+It downloads the latest version and runs `node scripts/install.mjs` again.
+
+## Requirements
+
+- Node.js 18 or later
+- Codex or Claude Code (app or terminal)
+- A KCH company Google account listed in the company directory
+
+## Contact
+
+Questions: **lee90@kchglobal.co.kr**
+
+---
+
+<p align="center"><b>Don't fill out forms. Just tell your AI.</b><br><sub>Internal tool for KCH Group.</sub></p>
