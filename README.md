@@ -8,20 +8,15 @@ Codex, Claude Code 등 쓰고 있는 AI(앱이든 터미널이든)에게 이렇�
 
 > https://github.com/lee90-creator/kch-ai-skill 이 스킬 설치해줘
 
+한 번만 설치하면 이 PC의 Codex, Claude Code 등 어디서든 쓸 수 있습니다. 업데이트도 같은 말("이 스킬 업데이트해줘")이면 됩니다.
+
 <details>
 <summary>AI가 설치 방법을 모를 때 (AI에게 보여 줄 내용)</summary>
 
-이 저장소 전체를 스킬 폴더에 `kch-ai` 라는 이름으로 내려받으면 됩니다.
-
-- Codex: `~/.codex/skills/kch-ai`
-- Claude Code: `~/.claude/skills/kch-ai`
-
-```
-git clone https://github.com/lee90-creator/kch-ai-skill ~/.codex/skills/kch-ai
-git clone https://github.com/lee90-creator/kch-ai-skill ~/.claude/skills/kch-ai
-```
-
-설치한 뒤 AI 앱을 다시 시작합니다. Node.js 18 이상이 필요합니다.
+1. 이 저장소를 아무 폴더에나 받습니다 (`git clone https://github.com/lee90-creator/kch-ai-skill` 또는 zip 다운로드 후 압축 풀기).
+2. 받은 폴더에서 `node scripts/install.mjs` 를 실행합니다.
+   - 스킬을 이 PC에 한 벌만 두고(`~/.kch-ai/skill`), Codex(`~/.codex/skills/kch-ai`), Claude Code(`~/.claude/skills/kch-ai`), Aside 가 모두 그 한 벌을 보도록 연결합니다.
+3. AI 앱을 다시 시작합니다. Node.js 18 이상이 필요합니다.
 </details>
 
 ## 사용

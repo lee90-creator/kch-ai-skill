@@ -14,6 +14,7 @@ node "<이 스킬 폴더>/scripts/kch-ai.mjs" <명령>
 - 처음 실행하면 브라우저에 [허용] 화면이 열리고 명령이 기다린다(최대 10분). 사용자에게 "브라우저에서 [허용]을 눌러 주세요"라고 알린다. 한 번 허용하면 다시 묻지 않는다.
 - 인터넷 연결 오류가 나면 샌드박스가 막은 것이다. 사용자에게 네트워크 허용(샌드박스 밖 실행)을 요청해 다시 실행한다.
 - `node` 가 없으면 Node.js LTS(https://nodejs.org) 설치를 안내한다.
+- "이 스킬 설치해줘 / 업데이트해줘" 요청: https://github.com/lee90-creator/kch-ai-skill 를 아무 폴더에 받아 `node scripts/install.mjs` 를 실행한다. 이 PC의 Codex·Claude Code·Aside 가 한 벌(`~/.kch-ai/skill`)을 같이 쓰게 연결된다.
 
 ## 기본 흐름: "이 프로젝트 정리해서 현황관리에 올려줘 / 업데이트해줘"
 
