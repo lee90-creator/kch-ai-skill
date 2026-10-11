@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.2.4';
+const VERSION = '1.3.0';
 const DEFAULT_SERVER = 'https://kch-ai-status.kch-lee90.workers.dev';
 const CONTACT = 'lee90@kchglobal.co.kr';
 const IS_WINDOWS = platform() === 'win32';
@@ -369,9 +369,16 @@ async function opAttach(options) {
       throw new UserError(`${basename(file)}: 비밀번호나 키로 보이는 내용이 있어 올리지 않았습니다.`);
     }
   }
+  // Every change goes with the project sheet (user rule 2026-10-11): no sheet, no upload.
+  const sheetPath = resolve(gitRoot(options.folder) || options.folder || process.cwd(), SHEET_NAME);
+  if (!existsSync(sheetPath)) throw new UserError(`정리 문서(${SHEET_NAME})가 없습니다. 먼저 sheet 로 틀을 받아 정리 문서를 쓰고 apply 로 반영한 뒤 첨부해 주세요. (저장소 안 파일이면 정리 문서의 ## 첨부 에 적고 apply 하면 됩니다)`);
+  checkFile(sheetPath);
   const profile = await me();
   const project = await requireProject(options, profile);
-  await confirm(`${project.title}: 첨부 ${files.length}개를 올립니다.\n${files.map((file) => `  ${file}`).join('\n')}\n첨부는 전 직원이 볼 수 있습니다.`, options);
+  const existingFiles = await attachmentsOf(project.id);
+  const sheetSha = createHash('sha256').update(readFileSync(sheetPath)).digest('hex');
+  const sheetExisting = existingFiles.find((item) => item.sha256 === sheetSha) ? null : { needed: true, existing: existingFiles.find((item) => item.name === SHEET_NAME) || null };
+  await confirm(`${project.title}: 첨부 ${files.length}개를 올립니다.\n${files.map((file) => `  ${file}`).join('\n')}${sheetExisting ? `\n  ${sheetPath} (정리 문서${sheetExisting.existing ? ' 새 버전' : ''})` : ''}\n첨부는 전 직원이 볼 수 있습니다.`, options);
   for (const file of files) {
     const bytes = readFileSync(file);
     const name = basename(file);
@@ -384,7 +391,8 @@ async function opAttach(options) {
     if (!uploadPath.startsWith('/files/')) throw new UserError('파일 올리기 주소를 받지 못했습니다. 잠시 후 다시 시도해 주세요.');
     await authed('PUT', uploadPath, { raw: bytes, contentType: mime });
   }
-  return `${project.title}: 첨부 ${files.length}개를 올렸습니다.\n${project.url}`;
+  if (sheetExisting) await uploadFile(project, sheetPath, sheetExisting.existing);
+  return `${project.title}: 첨부 ${files.length}개${sheetExisting ? '와 정리 문서' : ''}를 올렸습니다.\n${project.url}`;
 }
 
 /** Undo only what this computer changed, and only while nobody has changed those values since. */
@@ -750,11 +758,9 @@ const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
   apply [kch-ai-project.md]             정리 문서 기준으로 등록·업데이트 (소개서·역할·함께 하는 사람·첨부)
   show                                  이 폴더 프로젝트의 지금 내용 (없으면 '아직 없음')
   list                                  내 프로젝트 목록
-  new "이름" --stage "개발 중" --sentence "한 문장" [--before ..] [--progress ..] [--next ..]
-                                        새 프로젝트 등록 (이 폴더의 GitHub 저장소도 연결)
-  profile [--sentence ..] [--before ..] [--progress ..] [--next ..] [--stage ..]
-                                        소개서·진행 상태 업데이트
-  attach 파일...                        첨부 (PDF PNG JPG GIF MD TXT LOG, 20MB 이하)
+  attach 파일...                        저장소 밖 파일 첨부 (정리 문서 필요, 정리 문서도 함께 올라감)
+
+  모든 등록·업데이트는 kch-ai-project.md 를 고친 뒤 apply 로 합니다 (진행 상태 하나만 바꿀 때도).
   undo                                  마지막 변경 되돌리기 (24시간 안)
   login | logout | whoami | version
 
@@ -791,6 +797,9 @@ async function main() {
     options.stage = rest.join(' ');
   }
   if (raw === 'sentence' && rest.length) options.sentence = rest.join(' ');
+  if (command === 'new' || command === 'profile') {
+    throw new UserError('등록·업데이트는 정리 문서로만 합니다. kch-ai-project.md 를 만들거나 고친 뒤(없으면 sheet 로 틀 받기) apply 로 반영하세요. 진행 상태 하나만 바꿀 때도 같습니다.');
+  }
   switch (command) {
     case 'version':
       return console.log(VERSION);
