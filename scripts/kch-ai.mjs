@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.2.3';
+const VERSION = '1.2.4';
 const DEFAULT_SERVER = 'https://kch-ai-status.kch-lee90.workers.dev';
 const CONTACT = 'lee90@kchglobal.co.kr';
 const IS_WINDOWS = platform() === 'win32';
@@ -435,13 +435,14 @@ function parseRoles(text, where) {
 }
 
 const SHEET_SECTIONS = [
-  { key: 'after', match: /한\s*문장|어떤 일/, title: '어떤 일을 편하게 하나요 (한 문장, 필수)' },
-  { key: 'now', match: /예전/, title: '예전에는 어떻게 했나요' },
-  { key: 'progress_text', match: /지금|제한/, title: '지금 되는 부분이나 제한' },
-  { key: 'future_text', match: /앞으로/, title: '앞으로 할 일' },
-  { key: 'people', match: /함께|담당자|참여자/, title: '함께 하는 사람' },
-  { key: 'files', match: /첨부/, title: '첨부' },
-  { key: 'notes', match: /참고|메모|상세/, title: '참고 (현황관리 입력칸에는 들어가지 않고, 이 문서 첨부로만 공유)' },
+  // Headings are matched by how they start (the 참고 heading mentions 첨부, 2026-10-11).
+  { key: 'after', match: /^\s*(어떤 일|한\s*문장)/, title: '어떤 일을 편하게 하나요 (한 문장, 필수)' },
+  { key: 'now', match: /^\s*예전/, title: '예전에는 어떻게 했나요' },
+  { key: 'progress_text', match: /^\s*(지금|제한)/, title: '지금 되는 부분이나 제한' },
+  { key: 'future_text', match: /^\s*앞으로/, title: '앞으로 할 일' },
+  { key: 'people', match: /^\s*(함께|담당자|참여자)/, title: '함께 하는 사람' },
+  { key: 'files', match: /^\s*첨부/, title: '첨부' },
+  { key: 'notes', match: /^\s*(참고|메모|상세)/, title: '참고 (현황관리 입력칸에는 들어가지 않고, 이 문서 첨부로만 공유)' },
 ];
 
 function renderSheet(data) {
@@ -488,8 +489,12 @@ function parseSheet(text) {
   for (const key of ['after', 'now', 'progress_text', 'future_text']) if (buffer[key]) sheet.fields[key] = textOf(key);
   sheet.notes = textOf('notes');
   for (const line of buffer.people || []) {
-    const match = /^[-*]\s*([^(:：]+?)\s*(?:\(([^)]*)\))?\s*(?:[:：]\s*(.*))?$/.exec(line.trim());
-    if (match && match[1].trim()) sheet.people.push({ name: match[1].trim(), department: (match[2] || '').trim(), roles: (match[3] || '').trim() });
+    const text = line.trim();
+    if (!text || !/^[-*]/.test(text)) continue;
+    // Department may itself contain parentheses, e.g. 신재생사업본부(목포) (fixed 2026-10-11).
+    const match = /^[-*]\s*([^(:：]+?)\s*(?:\((.*)\))?\s*(?:[:：]\s*([^()]*))?$/.exec(text);
+    if (!match || !match[1].trim()) throw new UserError(`함께 하는 사람 줄을 읽지 못했습니다: "${text}". "- 이름 (본부): 역할, 역할" 형식으로 적어 주세요.`);
+    sheet.people.push({ name: match[1].trim(), department: (match[2] || '').trim(), roles: (match[3] || '').trim() });
   }
   for (const line of buffer.files || []) {
     const match = /^[-*]\s*(.+)$/.exec(line.trim());
