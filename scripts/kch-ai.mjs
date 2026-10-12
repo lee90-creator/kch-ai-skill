@@ -11,8 +11,10 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.3.0';
-const DEFAULT_SERVER = 'https://kch-ai-status.kch-lee90.workers.dev';
+const VERSION = '1.3.1';
+const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
+// The service moved (2026-10-12); a config saved with the old address follows it.
+const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
 const CONTACT = 'lee90@kchglobal.co.kr';
 const IS_WINDOWS = platform() === 'win32';
 const MAX_FILE_BYTES = 20_000_000;
@@ -69,7 +71,10 @@ function writePrivate(file, value) {
   }
 }
 const loadConfig = () => readJsonFile(CONFIG_FILE(), {});
-const serverUrl = (options = {}) => (options.server || process.env.KCH_AI_SERVER || loadConfig().server || DEFAULT_SERVER).replace(/\/+$/, '');
+const serverUrl = (options = {}) => {
+  const chosen = (options.server || process.env.KCH_AI_SERVER || loadConfig().server || DEFAULT_SERVER).replace(/\/+$/, '');
+  return MOVED_SERVERS.has(chosen) ? DEFAULT_SERVER : chosen;
+};
 
 /* ---------------- http ---------------- */
 

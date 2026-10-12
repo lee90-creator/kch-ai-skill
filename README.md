@@ -10,7 +10,7 @@ English | [한국어](README.ko.md)
 
 *Don't fill out forms. Just tell your AI.*
 
-[Quick Start](#quick-start) • [What It Does](#what-it-does) • [The Project Document](#the-project-document) • [For AI Agents](#for-ai-agents) • [KCH AI Status](https://kch-ai-status.kch-lee90.workers.dev) • [Contact](mailto:lee90@kchglobal.co.kr)
+[Quick Start](#quick-start) • [What It Does](#what-it-does) • [The Project Document](#the-project-document) • [For AI Agents](#for-ai-agents) • [KCH AI Status](https://ai.kchglobal.co.kr) • [Contact](mailto:lee90@kchglobal.co.kr)
 
 ---
 
