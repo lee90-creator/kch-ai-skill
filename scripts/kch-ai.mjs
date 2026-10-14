@@ -6,12 +6,12 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
 // The service moved (2026-10-12); a config saved with the old address follows it.
 const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
@@ -689,13 +689,39 @@ async function opApply(options) {
       plan.push(`${named ? '첨부 새 버전' : '첨부 추가'}: ${basename(sheetPath)} (이 정리 문서)`);
     }
   }
+  // 제출 코드 묶음: when the judgment cannot read the code on GitHub, send this folder's code privately (unchanged code is not sent again).
+  let pack = null;
+  let packHint = '';
+  if (!options.noPack) {
+    const linked = project?.repo ? (project.repo.url || `https://github.com/${project.repo.owner}/${project.repo.repo}`) : repo?.url || null;
+    let readable = false;
+    if (linked) {
+      try {
+        const check = await checkRepo(project?.id, linked);
+        // Readable for this person but not yet a verified link: verify it, or the judgment still cannot read it.
+        readable = check.state === 'ok' && (!check.private || !project || await saveVerifiedLink(project, linked, check));
+      } catch { readable = false; }
+    }
+    if (!readable && !root) {
+      // Outside a git folder the document may sit in Downloads or Desktop: never pack automatically there.
+      packHint = 'GitHub 없이 코드로 판단받으려면 프로젝트 코드가 있는 폴더에서 kch-ai pack 을 실행하세요.';
+    } else if (!readable) {
+      let built = null;
+      try { built = buildPack(root); } catch (error) { packHint = error instanceof UserError ? error.message : ''; }
+      const last = project ? lastPackFingerprint(project.id) : null;
+      if (built && built.files.length && built.fingerprint !== last) {
+        pack = built;
+        plan.push(`제출 코드 묶음 올리기: 코드 파일 ${built.files.length}개 (AI 수준 판단용 비공개 자료, 직원에게 안 보임${linked ? ', GitHub로 코드를 읽을 수 없어서' : ''})\n    ${packFileList(built)}`);
+      }
+    }
+  }
   if (kept.length) plan.push(`참고: ${kept.join(', ')} 은(는) 이미 올라가 있어 그대로 둡니다.`);
   if (merged.length) plan.push(`참고: ${merged.join(', ')} 이(가) 문서에 여러 줄이라 한 줄로 합쳤습니다 (역할도 합침).`);
   if (!plan.filter((line) => !line.startsWith('참고')).length) {
     return `${title}: 문서와 현황관리 내용이 이미 같습니다. 바꿀 것이 없습니다.${notListed.length ? `\n참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다. 빼려면 웹에서 하세요.` : ''}`;
   }
   if (notListed.length) plan.push(`참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다 (빼기는 웹에서).`);
-  await confirm(`${basename(sheetPath)} 기준으로 현황관리에 반영합니다.\n- ${plan.join('\n- ')}\n첨부는 전 직원이 볼 수 있습니다.`, options);
+  await confirm(`${basename(sheetPath)} 기준으로 현황관리에 반영합니다.\n- ${plan.join('\n- ')}\n첨부는 전 직원이 볼 수 있습니다.${pack ? ' 제출 코드 묶음은 판단용으로만 쓰이고 직원에게 보이지 않습니다.' : ''}`, options);
 
   // Apply, step by step: a failure reports what is already applied (re-running applies only the rest).
   const done = [];
@@ -752,8 +778,9 @@ async function opApply(options) {
     }
   }
   for (const upload of uploads) await step(`첨부 ${basename(upload.file)}`, () => uploadFile(project, upload.file, upload.existing));
+  if (pack) await step('제출 코드 묶음', () => uploadPack(project.id, pack));
   const repoUrl = project.repo?.url || (project.repo ? `https://github.com/${project.repo.owner}/${project.repo.repo}` : repo?.url || null);
-  const notice = await repoNotice(project, repoUrl);
+  const notice = pack ? `제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, 직원에게 안 보임). GitHub 없이도 AI 수준 판단이 이 코드를 읽습니다.${repoUrl ? '\n참고: 저장소를 읽기 연결하면(kch-ai repo) 그 뒤로는 GitHub 코드를 우선 씁니다.' : ''}` : [await repoNotice(project, repoUrl), packHint].filter(Boolean).join('\n');
   return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}${notice ? `\n${notice}` : ''}`;
 }
 
@@ -777,7 +804,7 @@ const BINARY_FILE = /\.(png|jpe?g|gif|webp|ico|bmp|pdf|zip|gz|tgz|7z|rar|woff2?|
 const repoName = (check, url) => (check?.owner && check?.repo ? `${check.owner}/${check.repo}` : String(url).replace(/^https:\/\/github\.com\//, ''));
 
 async function checkRepo(projectId, url) {
-  const result = await authed('POST', '/repo/check', { body: { url, project_id: projectId } });
+  const result = await authed('POST', '/repo/check', { body: { url, ...(projectId ? { project_id: projectId } : {}) } });
   return result.check;
 }
 
@@ -993,6 +1020,204 @@ async function opRepo(options) {
   throw new UserError(`10분 안에 연결이 확인되지 않았습니다. GitHub에서 승인을 마친 뒤 kch-ai repo 를 다시 실행하세요.\n  앱 승인: ${check.install_url || '(웹 프로젝트 화면의 저장소 칸)'}\n  계정 확인: ${verifyUrl}`);
 }
 
+/* ---------------- 제출 코드 묶음 (GitHub 없이 코드로 판단받기) ---------------- */
+
+const PACK_SKIP_DIRS = /(^|\/)(node_modules|dist|build|out|coverage|vendor|\.git|\.next|\.nuxt|\.cache|__pycache__|\.venv|venv|target|bin|obj|\.idea|\.vscode)(\/|$)/i;
+const PACK_SKIP_FILES = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|poetry\.lock|Cargo\.lock|composer\.lock)$/i;
+const PACK_CODE = /\.(ts|tsx|js|jsx|mjs|cjs|gs|py|cs|java|kt|go|rb|php|vue|svelte|sql|ps1|vba|bas|html|css)$/i;
+const PACK_MAX_FILES = 20;
+const PACK_FILE_CHARS = 14_000;
+const PACK_HTML_CHARS = 6_000;
+const PACK_TOTAL_CHARS = 140_000;
+const PACK_PART_CHARS = 70_000;
+const PACK_STATE_FILE = () => join(configDir(), 'code-packs.json');
+const PACK_KEY_LINE = /UrlFetchApp|\bfetch\(|axios|XMLHttpRequest|https?:\/\/|chrome\.(?:tabs|scripting|downloads|runtime|storage)|openai|gemini|anthropic|claude|gpt-|\broles?\b|권한|\badmin|관리자|approv|승인|\bstatus\b|상태|\bqueue|\bworker|dispatch|\bassign|LockService|\block\b|\bretry|\bresume|GmailApp|MailApp|SpreadsheetApp|CalendarApp|DriveApp|DocumentApp|HtmlService|\bdoGet\b|\bdoPost\b|Trigger/gi;
+
+/** Same pick as the server uses for GitHub: code and settings first, README and docs last. */
+function packScore(path) {
+  const name = path.split('/').pop().toLowerCase();
+  const depth = path.split('/').length - 1;
+  let s = 0;
+  if (/^readme(\.|$)/.test(name)) s = depth === 0 ? 35 : 10;
+  else if (name === 'manifest.json') s = 95;
+  else if (name === 'package.json' && depth === 0) s = 90;
+  else if (name === 'appsscript.json') s = 90;
+  else if (/^wrangler\.(toml|jsonc?)$/.test(name)) s = 85;
+  else if (/^(pyproject\.toml|requirements\.txt|setup\.py|go\.mod|pom\.xml)$/.test(name)) s = 80;
+  else if (/^(index|main|app|server|worker|background|content|popup|code|service-worker)\.[a-z]+$/.test(name) && PACK_CODE.test(name)) s = 75;
+  else if (/\.sql$/.test(name) && /migration/i.test(path)) s = 45;
+  else if (/\.md$/.test(name) && /(^|\/)docs?\//i.test(path)) s = 15;
+  else if (PACK_CODE.test(name)) s = /(^|\/)(src|lib|app|server|scripts?|content|background)\//i.test(path) ? 40 : 30;
+  else return 0;
+  if (/(^|\/)(tests?|__tests__|spec|e2e|fixtures?|examples?)\//i.test(path) || /\.(test|spec)\.[a-z]+$/.test(name)) s -= 30;
+  if (/(demo|sample|mock|redesign|backup|old|copy|draft|prototype|example)/i.test(name)) s -= 25;
+  if (/\.gs$/.test(name)) s += 15;
+  if (/\.css$/.test(name)) s -= 25;
+  if (/\.html?$/.test(name) && !/^index\./.test(name)) s -= 10;
+  if (/^(code|main)\.gs$/.test(name)) s += 20;
+  if (/\.min\.(js|css)$/.test(name)) return 0;
+  return s - depth * 2;
+}
+
+/** A long file: its beginning plus the lines around key words (same rule as the server). */
+function packExcerpt(text, cap) {
+  if (text.length <= cap) return { content: text, excerpted: false };
+  const lines = text.split('\n').map((line) => (line.length > 600 ? `${line.slice(0, 600)} …` : line));
+  const headChars = Math.floor(cap * 0.3);
+  let headEnd = 0;
+  for (let used = 0; headEnd < lines.length && used + lines[headEnd].length + 1 <= headChars; headEnd += 1) used += lines[headEnd].length + 1;
+  const byWord = new Map();
+  lines.forEach((line, index) => {
+    if (index < headEnd) return;
+    for (const match of line.matchAll(PACK_KEY_LINE)) {
+      const word = match[0].toLowerCase();
+      const list = byWord.get(word) ?? [];
+      if (list[list.length - 1] !== index) list.push(index);
+      byWord.set(word, list);
+    }
+  });
+  const keep = new Set();
+  let used = lines.slice(0, headEnd).join('\n').length;
+  const queues = [...byWord.values()];
+  let progressed = true;
+  while (progressed && used < cap) {
+    progressed = false;
+    for (const queue of queues) {
+      const at = queue.shift();
+      if (at === undefined) continue;
+      progressed = true;
+      for (let i = Math.max(headEnd, at - 2); i <= Math.min(lines.length - 1, at + 3); i += 1) {
+        if (keep.has(i)) continue;
+        if (used + lines[i].length + 1 > cap) break;
+        keep.add(i);
+        used += lines[i].length + 1;
+      }
+      if (used >= cap) break;
+    }
+  }
+  const parts = [lines.slice(0, headEnd).join('\n')];
+  let prev = headEnd - 1;
+  for (const index of [...keep].sort((a, b) => a - b)) {
+    if (index !== prev + 1) parts.push(`… (${index + 1}번째 줄)`);
+    parts.push(lines[index]);
+    prev = index;
+  }
+  const content = parts.join('\n').slice(0, cap);
+  return { content: content.trim().length >= 200 ? content : text.slice(0, cap), excerpted: true };
+}
+
+/** Files of the project folder: git's list (tracked and new, not ignored) or a plain walk. */
+function projectFiles(root) {
+  try {
+    const out = execFileSync('git', ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+    return [...new Set(out.split('\0').filter(Boolean))];
+  } catch { /* not a git folder */ }
+  const found = [];
+  const walk = (dir, rel, depth) => {
+    if (depth > 6 || found.length > 5000) return;
+    let entries = [];
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const path = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) { if (!PACK_SKIP_DIRS.test(`${path}/`)) walk(join(dir, entry.name), path, depth + 1); }
+      else if (entry.isFile()) found.push(path);
+    }
+  };
+  walk(root, '', 0);
+  return found;
+}
+
+const maskPack = (text) => PUBLIC_SECRET_PATTERNS.reduce((out, pattern) => out.replace(new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`), '[가림]'), text);
+
+/** Folders that are never a project (personal files would be packed). */
+function unsafePackRoot(root) {
+  const home = resolve(homedir());
+  const here = resolve(root);
+  if (here === home || here === resolve(home, '..') || here === resolve('/')) return true;
+  return ['Downloads', 'Desktop', 'Documents', 'OneDrive', '다운로드', '바탕 화면', '문서'].some((name) => here === resolve(home, name) || here === resolve(home, 'OneDrive', name));
+}
+
+/** Builds the private code pack from a folder: up to 20 files, 140,000 characters, in parts of 70,000. */
+function buildPack(root) {
+  if (unsafePackRoot(root)) throw new UserError(`${root} 는 프로젝트 폴더가 아니라서 코드를 묶지 않았습니다. 프로젝트 코드가 있는 폴더에서 실행하세요.`);
+  const all = projectFiles(root);
+  if (all.length > 2000) throw new UserError(`${root} 에 파일이 ${all.length}개로 너무 많아 코드를 묶지 않았습니다. 프로젝트 코드만 있는 폴더에서 실행하세요.`);
+  const picked = all
+    .filter((path) => !PACK_SKIP_DIRS.test(path) && !PACK_SKIP_FILES.test(path) && !BINARY_FILE.test(path) && !(SECRET_FILE.test(path) && !EXAMPLE_FILE.test(path)) && !/^kch-ai-code/.test(basename(path)))
+    .map((path) => ({ path, s: packScore(path) }))
+    .filter((item) => item.s > 0)
+    .sort((a, b) => b.s - a.s || a.path.localeCompare(b.path))
+    .slice(0, PACK_MAX_FILES);
+  const sections = [];
+  const files = [];
+  let left = PACK_TOTAL_CHARS;
+  for (const { path } of picked) {
+    const full = join(root, path);
+    let raw = '';
+    try {
+      const info = lstatSync(full);
+      if (!info.isFile() || info.size > 1_000_000) continue;
+      raw = readFileSync(full, 'utf8');
+    } catch { continue; }
+    if (raw.includes('\u0000')) continue;
+    const cap = Math.min(/\.html?$/i.test(path) ? PACK_HTML_CHARS : PACK_FILE_CHARS, left);
+    if (cap <= 200) break;
+    const { content, excerpted } = packExcerpt(maskPack(raw.replace(/\r\n/g, '\n')), cap);
+    left -= content.length;
+    const longest = Math.max(3, ...(content.match(/`{3,}/g) ?? []).map((run) => run.length));
+    const fence = '`'.repeat(longest + 1);
+    const ext = extname(path).slice(1).toLowerCase();
+    files.push({ path, chars: content.length, excerpted, total: raw.length });
+    sections.push(`### 파일: ${path} · ${excerpted ? `전체 ${raw.length.toLocaleString('en-US')}자 중 앞부분과 핵심 줄` : `전체 ${raw.length.toLocaleString('en-US')}자`}\n${fence}${ext}\n${content}\n${fence}\n`);
+  }
+  const fingerprint = createHash('sha256').update(sections.join('\n')).digest('hex');
+  const chunks = [];
+  for (const section of sections) {
+    if (!chunks.length || chunks[chunks.length - 1].length + section.length > PACK_PART_CHARS - 600) chunks.push('');
+    chunks[chunks.length - 1] += `${section}\n`;
+  }
+  const at = new Date().toISOString();
+  const parts = chunks.slice(0, 5).map((body, index, list) => ({
+    name: `kch-ai-code-${index + 1}.md`,
+    content: [`# kch-ai 제출 코드 (${index + 1}/${list.length})`, `- 만든 도구: kch-ai ${VERSION}`, `- 만든 시각: ${at}`, `- 폴더: ${basename(root)}`, `- 담은 파일: ${files.length}개 (폴더 전체 ${all.length}개 중, 코드·설정 먼저)`, '', body].join('\n'),
+  }));
+  return { parts, files, total: all.length, fingerprint };
+}
+
+const packKey = (projectId) => `${serverUrl()}|${projectId}`;
+const lastPackFingerprint = (projectId) => readJsonFile(PACK_STATE_FILE(), {})[packKey(projectId)]?.fingerprint ?? null;
+function rememberPack(projectId, fingerprint) {
+  const state = readJsonFile(PACK_STATE_FILE(), {});
+  state[packKey(projectId)] = { fingerprint, at: new Date().toISOString() };
+  writePrivate(PACK_STATE_FILE(), state);
+}
+const packFileList = (pack) => `${pack.files.slice(0, 10).map((file) => file.path).join(', ')}${pack.files.length > 10 ? ` 외 ${pack.files.length - 10}개` : ''}`;
+
+async function uploadPack(projectId, pack) {
+  await authed('PUT', `/projects/${encodeURIComponent(projectId)}/code-pack`, { body: { parts: pack.parts, generator: `kch-ai ${VERSION}` } });
+  rememberPack(projectId, pack.fingerprint);
+}
+
+/** kch-ai pack: send this folder's code privately so the judgment can read it without GitHub. */
+async function opPack(options) {
+  const profile = await me();
+  const project = await requireProject(options, profile);
+  const root = gitRoot(options.folder) || resolve(options.folder || process.cwd());
+  const pack = buildPack(root);
+  if (!pack.files.length) throw new UserError(`${root} 에서 담을 코드 파일을 찾지 못했습니다. 프로젝트 코드가 있는 폴더에서 실행하세요 (Apps Script는 .gs 파일을 이 폴더에 내려받은 뒤).`);
+  const summary = [
+    `${project.title}: 이 폴더의 코드로 제출 코드 묶음을 만들어 올립니다.`,
+    `  폴더: ${root}`,
+    `  담을 파일 ${pack.files.length}개 (폴더 전체 ${pack.total}개 중, 코드·설정 먼저): ${packFileList(pack)}`,
+    '  AI 수준 판단에만 쓰이는 비공개 자료입니다. 직원들에게는 보이지 않습니다. 키·비밀번호로 보이는 값은 가려서 담습니다.',
+    '  GitHub로 코드를 읽을 수 있는 프로젝트는 GitHub를 먼저 씁니다.',
+  ].join('\n');
+  await confirm(summary, options);
+  await uploadPack(project.id, pack);
+  return `${project.title}: 제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, ${pack.parts.length}개로 나눔). 다음 AI 수준 판단부터 이 코드를 읽습니다.`;
+}
+
 /* ---------------- CLI ---------------- */
 
 const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
@@ -1004,6 +1229,7 @@ const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
   attach 파일...                        저장소 밖 파일 첨부 (정리 문서 필요, 정리 문서도 함께 올라감)
   repo                                  AI 수준 판단이 이 저장소 코드를 읽게 연결 (비공개 유지, GitHub 승인 화면 열림)
   repo --public                         저장소를 공개로 전환 (키·비밀번호 검사 후, gh 필요)
+  pack                                  GitHub 없이: 이 폴더 코드를 판단용 비공개 묶음으로 올리기 (apply 때 자동)
 
   모든 등록·업데이트는 kch-ai-project.md 를 고친 뒤 apply 로 합니다 (진행 상태 하나만 바꿀 때도).
   undo                                  마지막 변경 되돌리기 (24시간 안)
@@ -1024,6 +1250,7 @@ function parseArgs(argv) {
     else if (arg === '--public') options.public = true;
     else if (arg === '--no-wait') options.noWait = true;
     else if (arg === '--wait') options.wait = true;
+    else if (arg === '--no-pack') options.noPack = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg.startsWith('--') && eq > 2 && VALUE_FLAGS.has(arg.slice(2, eq))) options[arg.slice(2, eq)] = arg.slice(eq + 1);
     else if (arg.startsWith('--') && VALUE_FLAGS.has(arg.slice(2))) options[arg.slice(2)] = argv[++index] ?? '';
@@ -1034,7 +1261,7 @@ function parseArgs(argv) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const aliases = { 저장소: 'repo', 정리: 'sheet', 반영: 'apply', sentence: 'profile', status: 'profile', setup: 'login', ls: 'list', 등록: 'new', 업데이트: 'profile', 보기: 'show', 첨부: 'attach', 되돌리기: 'undo' };
+  const aliases = { 저장소: 'repo', 코드: 'pack', 정리: 'sheet', 반영: 'apply', sentence: 'profile', status: 'profile', setup: 'login', ls: 'list', 등록: 'new', 업데이트: 'profile', 보기: 'show', 첨부: 'attach', 되돌리기: 'undo' };
   const raw = options._[0] || 'help';
   const command = aliases[raw] || raw;
   const rest = options._.slice(1);
@@ -1084,6 +1311,8 @@ async function main() {
       return console.log(await opUndo(options));
     case 'repo':
       return console.log(await opRepo(options));
+    case 'pack':
+      return console.log(await opPack(options));
     default:
       throw new UserError(`알 수 없는 명령입니다: ${raw}\n\n${HELP}`);
   }
