@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
 // The service moved (2026-10-12); a config saved with the old address follows it.
 const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
@@ -704,14 +704,14 @@ async function opApply(options) {
     }
     if (!readable && !root) {
       // Outside a git folder the document may sit in Downloads or Desktop: never pack automatically there.
-      packHint = 'GitHub 없이 코드로 판단받으려면 프로젝트 코드가 있는 폴더에서 kch-ai pack 을 실행하세요.';
+      packHint = 'GitHub 없이 코드를 보내려면 프로젝트 코드가 있는 폴더에서 kch-ai pack 을 실행하세요.';
     } else if (!readable) {
       let built = null;
       try { built = buildPack(root); } catch (error) { packHint = error instanceof UserError ? error.message : ''; }
       const last = project ? lastPackFingerprint(project.id) : null;
       if (built && built.files.length && built.fingerprint !== last) {
         pack = built;
-        plan.push(`제출 코드 묶음 올리기: 코드 파일 ${built.files.length}개 (AI 수준 판단용 비공개 자료, 직원에게 안 보임${linked ? ', GitHub로 코드를 읽을 수 없어서' : ''})\n    ${packFileList(built)}`);
+        plan.push(`제출 코드 묶음 올리기: 코드 파일 ${built.files.length}개 (관리자 검토용 비공개 자료, 직원에게 안 보임${linked ? ', GitHub로 코드를 읽을 수 없어서' : ''})\n    ${packFileList(built)}`);
       }
     }
   }
@@ -721,7 +721,7 @@ async function opApply(options) {
     return `${title}: 문서와 현황관리 내용이 이미 같습니다. 바꿀 것이 없습니다.${notListed.length ? `\n참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다. 빼려면 웹에서 하세요.` : ''}`;
   }
   if (notListed.length) plan.push(`참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다 (빼기는 웹에서).`);
-  await confirm(`${basename(sheetPath)} 기준으로 현황관리에 반영합니다.\n- ${plan.join('\n- ')}\n첨부는 전 직원이 볼 수 있습니다.${pack ? ' 제출 코드 묶음은 판단용으로만 쓰이고 직원에게 보이지 않습니다.' : ''}`, options);
+  await confirm(`${basename(sheetPath)} 기준으로 현황관리에 반영합니다.\n- ${plan.join('\n- ')}\n첨부는 전 직원이 볼 수 있습니다.${pack ? ' 제출 코드 묶음은 관리자 검토용으로만 쓰이고 직원에게 보이지 않습니다.' : ''}`, options);
 
   // Apply, step by step: a failure reports what is already applied (re-running applies only the rest).
   const done = [];
@@ -780,11 +780,11 @@ async function opApply(options) {
   for (const upload of uploads) await step(`첨부 ${basename(upload.file)}`, () => uploadFile(project, upload.file, upload.existing));
   if (pack) await step('제출 코드 묶음', () => uploadPack(project.id, pack));
   const repoUrl = project.repo?.url || (project.repo ? `https://github.com/${project.repo.owner}/${project.repo.repo}` : repo?.url || null);
-  const notice = pack ? `제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, 직원에게 안 보임). GitHub 없이도 AI 수준 판단이 이 코드를 읽습니다.${repoUrl ? '\n참고: 저장소를 읽기 연결하면(kch-ai repo) 그 뒤로는 GitHub 코드를 우선 씁니다.' : ''}` : [await repoNotice(project, repoUrl), packHint].filter(Boolean).join('\n');
+  const notice = pack ? `제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, 직원에게 안 보임). GitHub 없이도 현황관리가 이 코드를 읽습니다.${repoUrl ? '\n참고: 저장소를 읽기 연결하면(kch-ai repo) 그 뒤로는 GitHub 코드를 우선 씁니다.' : ''}` : [await repoNotice(project, repoUrl), packHint].filter(Boolean).join('\n');
   return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}${notice ? `\n${notice}` : ''}`;
 }
 
-/* ---------------- repository access (AI 수준 판단이 코드를 읽을 수 있나) ---------------- */
+/* ---------------- repository access (현황관리가 코드를 읽을 수 있나) ---------------- */
 
 const REPO_WAIT_MS = 10 * 60 * 1000;
 const REPO_POLL_MS = 5000;
@@ -820,7 +820,7 @@ async function saveVerifiedLink(project, url, check) {
 }
 
 const unreadableNotice = (name) => [
-  `주의: 저장소 ${name} 는 비공개이거나 주소가 맞지 않아 AI 수준 판단이 코드를 읽지 못합니다 (문서만으로 판단돼 "확인 자료 부족"으로 보일 수 있습니다).`,
+  `주의: 저장소 ${name} 는 비공개이거나 주소가 맞지 않아 현황관리가 코드를 읽지 못합니다 (문서 설명만으로 정리됩니다).`,
   '  사용자에게 어느 쪽으로 할지 물어본 뒤 실행하세요:',
   '  - 읽기 연결 (추천, 저장소는 비공개 유지): kch-ai repo',
   '  - 공개로 전환 (키·비밀번호 검사 후 전환, 사용자가 "공개"에 직접 동의한 경우만): kch-ai repo --public',
@@ -833,7 +833,7 @@ async function repoNotice(project, url) {
     const check = await checkRepo(project.id, url);
     const name = repoName(check, url);
     if (check.state === 'ok' && await saveVerifiedLink(project, url, check)) {
-      return check.private ? `저장소 ${name}: 비공개 · 읽기 연결됨 (AI 수준 판단이 코드를 읽습니다)` : `저장소 ${name}: 공개 (AI 수준 판단이 코드를 읽습니다)`;
+      return check.private ? `저장소 ${name}: 비공개 · 읽기 연결됨 (현황관리가 코드를 읽습니다)` : `저장소 ${name}: 공개 (현황관리가 코드를 읽습니다)`;
     }
     if (check.state === 'ok' || check.state === 'need_login' || check.state === 'no_access') return unreadableNotice(name);
     return `참고: 저장소 ${name} 를 지금 확인하지 못했습니다 (${check.state}). 나중에 kch-ai repo 로 다시 확인할 수 있습니다.`;
@@ -968,13 +968,13 @@ async function makePublic(project, url, check, options) {
     const after = await checkRepo(project.id, url).catch(() => null);
     if (after?.state === 'ok') {
       await authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url } }).catch(() => null);
-      return `${name} 를 공개로 바꿨습니다. AI 수준 판단이 이제 코드를 읽습니다 (다음 판단부터 반영).`;
+      return `${name} 를 공개로 바꿨습니다. 현황관리가 이제 코드를 읽습니다.`;
     }
   }
   return `${name} 를 공개로 바꿨습니다. GitHub 반영에 시간이 걸리는 중이라 잠시 뒤 kch-ai repo 로 다시 확인해 주세요.`;
 }
 
-/** kch-ai repo [--public]: make sure the AI 수준 judgment can read this project's repository. */
+/** kch-ai repo [--public]: make sure KCH AI Status can read this project's repository. */
 async function opRepo(options) {
   const profile = await me();
   const project = await requireProject(options, profile);
@@ -989,7 +989,7 @@ async function opRepo(options) {
   const check = await checkRepo(project.id, url);
   const name = repoName(check, url);
   if (check.state === 'ok' && await saveVerifiedLink(project, url, check)) {
-    return `저장소 ${name}: ${check.private ? '비공개 · 읽기 연결됨' : '공개'}. AI 수준 판단이 코드를 읽을 수 있습니다.`;
+    return `저장소 ${name}: ${check.private ? '비공개 · 읽기 연결됨' : '공개'}. 현황관리가 코드를 읽을 수 있습니다.`;
   }
   if (check.state === 'ok') throw new UserError(`저장소 ${name} 를 읽을 수는 있지만 연결을 확정하지 못했습니다. 잠시 뒤 kch-ai repo 를 다시 실행하세요.`);
   if (check.state !== 'need_login' && check.state !== 'no_access') {
@@ -998,7 +998,7 @@ async function opRepo(options) {
   if (options.public) return makePublic(project, url, check, options);
   const verifyUrl = `${serverUrl()}/github-installed?start=verify`;
   const steps = [
-    `저장소 ${name} 를 비공개로 둔 채 AI 수준 판단이 읽을 수 있게 연결합니다 (읽기만 하고 코드를 바꾸지 않습니다).`,
+    `저장소 ${name} 를 비공개로 둔 채 현황관리가 읽을 수 있게 연결합니다 (읽기만 하고 코드를 바꾸지 않습니다).`,
     `  1) 브라우저에 GitHub 앱 승인 화면이 열립니다. "Only select repositories"에서 ${name} 를 고르고 Install 을 누르세요.`,
     '     (회사 Organization 저장소는 조직 관리자의 승인이 필요할 수 있습니다)',
     '  2) 설치가 끝나면 KCH AI 현황관리로 돌아와 GitHub 계정 확인(Authorize)으로 바로 이어집니다.',
@@ -1015,12 +1015,12 @@ async function opRepo(options) {
   // AI tools usually stop a command after about 2 minutes: wait 90 s there, 10 min in a real terminal (or with --wait).
   const waitMs = options.wait || process.stdout.isTTY ? REPO_WAIT_MS : 90_000;
   const done = await waitReadable(project, url, { verifyUrl, noBrowser: options.noBrowser, waitMs });
-  if (done) return `연결됐습니다. 저장소 ${name}: 비공개 · 읽기 연결됨. AI 수준 판단이 코드를 읽습니다 (다음 판단부터 반영).`;
+  if (done) return `연결됐습니다. 저장소 ${name}: 비공개 · 읽기 연결됨. 현황관리가 코드를 읽습니다.`;
   if (waitMs < REPO_WAIT_MS) return `아직 승인이 끝나지 않았습니다. 사용자가 GitHub에서 Install·Authorize 를 마치면 kch-ai repo 를 다시 실행하세요.\n  앱 승인: ${check.install_url || '(웹 프로젝트 화면의 저장소 칸)'}\n  계정 확인: ${verifyUrl}`;
   throw new UserError(`10분 안에 연결이 확인되지 않았습니다. GitHub에서 승인을 마친 뒤 kch-ai repo 를 다시 실행하세요.\n  앱 승인: ${check.install_url || '(웹 프로젝트 화면의 저장소 칸)'}\n  계정 확인: ${verifyUrl}`);
 }
 
-/* ---------------- 제출 코드 묶음 (GitHub 없이 코드로 판단받기) ---------------- */
+/* ---------------- 제출 코드 묶음 (GitHub 없이 코드 보내기) ---------------- */
 
 const PACK_SKIP_DIRS = /(^|\/)(node_modules|dist|build|out|coverage|vendor|\.git|\.next|\.nuxt|\.cache|__pycache__|\.venv|venv|target|bin|obj|\.idea|\.vscode)(\/|$)/i;
 const PACK_SKIP_FILES = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|poetry\.lock|Cargo\.lock|composer\.lock)$/i;
@@ -1039,15 +1039,16 @@ function packScore(path) {
   const depth = path.split('/').length - 1;
   let s = 0;
   if (/^readme(\.|$)/.test(name)) s = depth === 0 ? 35 : 10;
-  else if (name === 'manifest.json') s = 95;
+  else if (/(^|\/)docs?\//i.test(path) && !/\.md$/.test(name)) return 0; // design mockups and exports under docs/
+  else if (name === 'manifest.json') s = depth === 0 ? 95 : 60;
   else if (name === 'package.json' && depth === 0) s = 90;
   else if (name === 'appsscript.json') s = 90;
   else if (/^wrangler\.(toml|jsonc?)$/.test(name)) s = 85;
   else if (/^(pyproject\.toml|requirements\.txt|setup\.py|go\.mod|pom\.xml)$/.test(name)) s = 80;
   else if (/^(index|main|app|server|worker|background|content|popup|code|service-worker)\.[a-z]+$/.test(name) && PACK_CODE.test(name)) s = 75;
-  else if (/\.sql$/.test(name) && /migration/i.test(path)) s = 45;
+  else if (/\.sql$/.test(name) && /migration/i.test(path)) s = 20;
   else if (/\.md$/.test(name) && /(^|\/)docs?\//i.test(path)) s = 15;
-  else if (PACK_CODE.test(name)) s = /(^|\/)(src|lib|app|server|scripts?|content|background)\//i.test(path) ? 40 : 30;
+  else if (PACK_CODE.test(name)) s = /(^|\/)(src|lib|app|server|content|background)\//i.test(path) ? 40 : 30;
   else return 0;
   if (/(^|\/)(tests?|__tests__|spec|e2e|fixtures?|examples?)\//i.test(path) || /\.(test|spec)\.[a-z]+$/.test(name)) s -= 30;
   if (/(demo|sample|mock|redesign|backup|old|copy|draft|prototype|example)/i.test(name)) s -= 25;
@@ -1148,6 +1149,10 @@ function buildPack(root) {
     .map((path) => ({ path, s: packScore(path) }))
     .filter((item) => item.s > 0)
     .sort((a, b) => b.s - a.s || a.path.localeCompare(b.path))
+    // Same score: alternate between folders (src/client, src/server, ...) so one big folder does not take every slot.
+    .reduce((acc, item) => { const dir = item.path.split('/').slice(0, -1).join('/'); const rank = acc.counts.get(dir) ?? 0; acc.counts.set(dir, rank + 1); acc.items.push({ ...item, rank }); return acc; }, { counts: new Map(), items: [] }).items
+    .sort((a, b) => b.s - a.s || a.rank - b.rank || a.path.localeCompare(b.path))
+    .filter((item, index, list) => !/\.sql$/i.test(item.path) || !/migration/i.test(item.path) || list.slice(0, index).filter((prev) => /\.sql$/i.test(prev.path) && /migration/i.test(prev.path)).length < 2)
     .slice(0, PACK_MAX_FILES);
   const sections = [];
   const files = [];
@@ -1210,12 +1215,12 @@ async function opPack(options) {
     `${project.title}: 이 폴더의 코드로 제출 코드 묶음을 만들어 올립니다.`,
     `  폴더: ${root}`,
     `  담을 파일 ${pack.files.length}개 (폴더 전체 ${pack.total}개 중, 코드·설정 먼저): ${packFileList(pack)}`,
-    '  AI 수준 판단에만 쓰이는 비공개 자료입니다. 직원들에게는 보이지 않습니다. 키·비밀번호로 보이는 값은 가려서 담습니다.',
+    '  관리자 검토에만 쓰이는 비공개 자료입니다. 직원들에게는 보이지 않습니다. 키·비밀번호로 보이는 값은 가려서 담습니다.',
     '  GitHub로 코드를 읽을 수 있는 프로젝트는 GitHub를 먼저 씁니다.',
   ].join('\n');
   await confirm(summary, options);
   await uploadPack(project.id, pack);
-  return `${project.title}: 제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, ${pack.parts.length}개로 나눔). 다음 AI 수준 판단부터 이 코드를 읽습니다.`;
+  return `${project.title}: 제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, ${pack.parts.length}개로 나눔). 현황관리가 이 코드를 읽습니다.`;
 }
 
 /* ---------------- CLI ---------------- */
@@ -1227,9 +1232,9 @@ const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
   show                                  이 폴더 프로젝트의 지금 내용 (없으면 '아직 없음')
   list                                  내 프로젝트 목록
   attach 파일...                        저장소 밖 파일 첨부 (정리 문서 필요, 정리 문서도 함께 올라감)
-  repo                                  AI 수준 판단이 이 저장소 코드를 읽게 연결 (비공개 유지, GitHub 승인 화면 열림)
+  repo                                  현황관리가 이 저장소 코드를 읽게 연결 (비공개 유지, GitHub 승인 화면 열림)
   repo --public                         저장소를 공개로 전환 (키·비밀번호 검사 후, gh 필요)
-  pack                                  GitHub 없이: 이 폴더 코드를 판단용 비공개 묶음으로 올리기 (apply 때 자동)
+  pack                                  GitHub 없이: 이 폴더 코드를 관리자 검토용 비공개 묶음으로 올리기 (apply 때 자동)
 
   모든 등록·업데이트는 kch-ai-project.md 를 고친 뒤 apply 로 합니다 (진행 상태 하나만 바꿀 때도).
   undo                                  마지막 변경 되돌리기 (24시간 안)

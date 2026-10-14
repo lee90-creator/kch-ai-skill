@@ -67,7 +67,7 @@ That's it. Your AI writes a project document, shows you exactly what will change
 | "Add 김혜민 as QA" | Adds a teammate line → finds them in the company directory → posts it |
 | "Attach this screenshot" | Adds the file to the document's attachment list → uploads it with the document |
 | "Undo that" | Reverts this PC's last change (within 24 hours, and only if nobody edited it since) |
-| (no GitHub) | `apply` also sends this folder's code as a private code pack, read only by the AI judgment and never shown to other employees |
+| (no GitHub) | `apply` also sends this folder's code as a private code pack, used only for the operators' review and never shown to other employees |
 | "Let it read my private repo" | Opens the GitHub app approval for this repository (it stays private) and waits until KCH AI Status can read the code |
 
 Not done by the skill (use the website): removing teammates, deleting attachments, renaming a project.
