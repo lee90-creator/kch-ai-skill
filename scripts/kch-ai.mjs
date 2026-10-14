@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
 // The service moved (2026-10-12); a config saved with the old address follows it.
 const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
@@ -91,7 +91,7 @@ async function call(method, path, { body, token, server, raw, contentType } = {}
   }
   let response;
   try {
-    response = await fetch(`${server}/api/agent/v1${path}`, { method, headers, body: payload });
+    response = await fetch(`${server}/api/agent/v1${path}`, { method, headers, body: payload, ...(raw === undefined ? { signal: AbortSignal.timeout(30_000) } : {}) });
   } catch (error) {
     throw new UserError(`서버(${server})에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요. AI 도구의 샌드박스가 인터넷을 막고 있다면 샌드박스 밖 실행을 허용해 주세요. (${error?.cause?.code || error?.message || error})`);
   }
@@ -128,7 +128,7 @@ function openBrowser(url) {
   try {
     if (IS_WINDOWS) spawn('rundll32', ['url.dll,FileProtocolHandler', url], { detached: true, stdio: 'ignore' }).unref();
     else if (platform() === 'darwin') spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
-    else if (existsSync('/proc/version') && /microsoft/i.test(readFileSync('/proc/version', 'utf8'))) spawn('cmd.exe', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' }).unref();
+    else if (existsSync('/proc/version') && /microsoft/i.test(readFileSync('/proc/version', 'utf8'))) spawn('cmd.exe', ['/c', 'start', '', url.replace(/[&^|<>]/g, '^$&')], { detached: true, stdio: 'ignore' }).unref();
     else spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
   } catch {
     /* the URL is printed anyway */
@@ -752,7 +752,245 @@ async function opApply(options) {
     }
   }
   for (const upload of uploads) await step(`첨부 ${basename(upload.file)}`, () => uploadFile(project, upload.file, upload.existing));
-  return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}`;
+  const repoUrl = project.repo?.url || (project.repo ? `https://github.com/${project.repo.owner}/${project.repo.repo}` : repo?.url || null);
+  const notice = await repoNotice(project, repoUrl);
+  return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}${notice ? `\n${notice}` : ''}`;
+}
+
+/* ---------------- repository access (AI 수준 판단이 코드를 읽을 수 있나) ---------------- */
+
+const REPO_WAIT_MS = 10 * 60 * 1000;
+const REPO_POLL_MS = 5000;
+/** Strong signs of a credential in a tracked file (plain variable names like `token = config.token` are not flagged). */
+const PUBLIC_SECRET_PATTERNS = [
+  /sk-[A-Za-z0-9_-]{20,}/, /AKIA[0-9A-Z]{16}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /gh[pousr]_[A-Za-z0-9]{30,}/, /github_pat_[A-Za-z0-9_]{30,}/,
+  /AIza[0-9A-Za-z_-]{30,}/, /xox[abpr]-[A-Za-z0-9-]{10,}/, /kch(ai|dc)_[A-Za-z0-9_-]{20,}/,
+  /["']?(api[_-]?key|access[_-]?key|secret[_-]?key|client[_-]?secret|secret|token|password|passwd|pwd|비밀번호)["']?\s*[:=]\s*["'][^"'\s]{12,}["']/i,
+  /\bbearer\s+[A-Za-z0-9_\-.=+/]{30,}/i,
+  /\b[sr]k_(live|test)_[A-Za-z0-9]{16,}/, /GOCSPX-[A-Za-z0-9_-]{20,}/, /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+  /hooks\.slack\.com\/services\/[A-Za-z0-9/]{20,}/, /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/,
+];
+const EXAMPLE_FILE = /\.(example|sample|template|dist)$/i;
+const SECRET_FILE = /(^|\/)(\.env(\..+)?|id_rsa|id_ed25519|credentials\.json|service[-_]?account.*\.json)$|\.(pem|p12|pfx|key|keystore|jks)$/i;
+const BINARY_FILE = /\.(png|jpe?g|gif|webp|ico|bmp|pdf|zip|gz|tgz|7z|rar|woff2?|ttf|otf|eot|mp[34]|mov|avi|wav|xlsx?|docx?|pptx?|exe|dll|so|dylib|jar|class|pyc|wasm|lock)$/i;
+
+const repoName = (check, url) => (check?.owner && check?.repo ? `${check.owner}/${check.repo}` : String(url).replace(/^https:\/\/github\.com\//, ''));
+
+async function checkRepo(projectId, url) {
+  const result = await authed('POST', '/repo/check', { body: { url, project_id: projectId } });
+  return result.check;
+}
+
+/**
+ * A readable private repository must also be saved as a verified link, or the judgment still skips it.
+ * True when the judgment can read it: public, already verified, or verified now.
+ */
+async function saveVerifiedLink(project, url, check) {
+  if (check.state !== 'ok') return false;
+  if (!check.private || project.repo?.verified) return true;
+  const saved = await authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url } }).catch(() => null);
+  return Boolean(saved?.repo?.verified);
+}
+
+const unreadableNotice = (name) => [
+  `주의: 저장소 ${name} 는 비공개이거나 주소가 맞지 않아 AI 수준 판단이 코드를 읽지 못합니다 (문서만으로 판단돼 "확인 자료 부족"으로 보일 수 있습니다).`,
+  '  사용자에게 어느 쪽으로 할지 물어본 뒤 실행하세요:',
+  '  - 읽기 연결 (추천, 저장소는 비공개 유지): kch-ai repo',
+  '  - 공개로 전환 (키·비밀번호 검사 후 전환, 사용자가 "공개"에 직접 동의한 경우만): kch-ai repo --public',
+].join('\n');
+
+/** One status line (or a warning with the two ways to fix it) after apply. Never throws. */
+async function repoNotice(project, url) {
+  if (!url) return '';
+  try {
+    const check = await checkRepo(project.id, url);
+    const name = repoName(check, url);
+    if (check.state === 'ok' && await saveVerifiedLink(project, url, check)) {
+      return check.private ? `저장소 ${name}: 비공개 · 읽기 연결됨 (AI 수준 판단이 코드를 읽습니다)` : `저장소 ${name}: 공개 (AI 수준 판단이 코드를 읽습니다)`;
+    }
+    if (check.state === 'ok' || check.state === 'need_login' || check.state === 'no_access') return unreadableNotice(name);
+    return `참고: 저장소 ${name} 를 지금 확인하지 못했습니다 (${check.state}). 나중에 kch-ai repo 로 다시 확인할 수 있습니다.`;
+  } catch {
+    return '';
+  }
+}
+
+async function waitReadable(project, url, { verifyUrl, noBrowser, waitMs }) {
+  const started = Date.now();
+  let reopened = false;
+  log(`GitHub에서 승인을 마칠 때까지 기다립니다 (최대 ${waitMs >= 120_000 ? `${Math.round(waitMs / 60_000)}분` : `${Math.round(waitMs / 1000)}초`}, 끝나면 자동으로 이어집니다)...`);
+  const config = loadConfig();
+  while (Date.now() - started < waitMs) {
+    await new Promise((done) => setTimeout(done, REPO_POLL_MS));
+    let check = null;
+    try {
+      check = (await call('POST', '/repo/check', { body: { url, project_id: project.id }, token: config.token, server: serverUrl() }))?.check ?? null;
+    } catch (error) {
+      if (error instanceof UserError && error.code === 3) throw new UserError('이 컴퓨터의 연결이 끊겼습니다. kch-ai login 으로 다시 연결한 뒤 kch-ai repo 를 실행하세요.');
+      check = null;
+    }
+    if (check?.state === 'ok' && await saveVerifiedLink(project, url, check)) return check;
+    // Already installed apps do not come back by themselves: open the account check once.
+    if (!reopened && verifyUrl && Date.now() - started > 60_000) {
+      reopened = true;
+      log(`아직 확인되지 않았습니다. 앱이 이미 설치돼 있었다면 이 화면에서 GitHub 계정 확인을 마쳐 주세요: ${verifyUrl}`);
+      if (!noBrowser) openBrowser(verifyUrl);
+    }
+  }
+  return null;
+}
+
+/** Committed files that look like they hold a key, on every branch and tag tip (what GitHub would publish). */
+function scanCommittedSecrets(root) {
+  const git = (args, extra = {}) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['pipe', 'pipe', 'ignore'], ...extra });
+  let tips = [];
+  try {
+    tips = [...new Set(git(['for-each-ref', '--format=%(objectname)', 'refs/heads', 'refs/remotes', 'refs/tags']).split('\n').map((line) => line.trim()).filter(Boolean))];
+  } catch {
+    throw new UserError('git 기록을 읽지 못해 키 검사를 할 수 없습니다. 공개로 바꾸지 않았습니다.');
+  }
+  const blobs = new Map();
+  const hits = [];
+  const skipped = [];
+  for (const tip of tips.slice(0, 200)) {
+    let listing = '';
+    try { listing = git(['ls-tree', '-r', '-z', '-l', tip]); } catch { continue; }
+    for (const entry of listing.split('\0').filter(Boolean)) {
+      const tab = entry.indexOf('\t');
+      const [mode, type, oid, size] = entry.slice(0, tab).trim().split(/\s+/);
+      const path = entry.slice(tab + 1);
+      if (type !== 'blob' || mode === '120000' || blobs.has(oid)) continue;
+      if (SECRET_FILE.test(path) && !EXAMPLE_FILE.test(path)) { hits.push(`${path} (키·인증 파일)`); blobs.set(oid, null); continue; }
+      if (BINARY_FILE.test(path)) { blobs.set(oid, null); continue; }
+      if (Number(size) > 2_000_000) { skipped.push(path); blobs.set(oid, null); continue; }
+      blobs.set(oid, path);
+    }
+    if (blobs.size > 60000) throw new UserError('파일이 너무 많아 키 검사를 끝내지 못했습니다. 공개로 바꾸지 않았습니다.');
+  }
+  const wanted = [...blobs.entries()].filter(([, path]) => path);
+  for (let start = 0; start < wanted.length && hits.length < 20; start += 400) {
+    const chunk = wanted.slice(start, start + 400);
+    const out = execFileSync('git', ['-C', root, 'cat-file', '--batch'], { input: chunk.map(([oid]) => oid).join('\n') + '\n', maxBuffer: 512 * 1024 * 1024, stdio: ['pipe', 'pipe', 'ignore'] });
+    let offset = 0;
+    for (const [, path] of chunk) {
+      const headerEnd = out.indexOf(10, offset);
+      if (headerEnd < 0) break;
+      const size = Number(out.slice(offset, headerEnd).toString('utf8').split(' ')[2] || 0);
+      const body = out.subarray(headerEnd + 1, headerEnd + 1 + size);
+      offset = headerEnd + 1 + size + 1;
+      if (body.subarray(0, 8000).includes(0)) continue; // binary
+      const lines = body.toString('utf8').split(/\r?\n/);
+      for (let index = 0; index < lines.length; index += 1) {
+        if (PUBLIC_SECRET_PATTERNS.some((pattern) => pattern.test(lines[index]))) { hits.push(`${path}:${index + 1}`); break; }
+      }
+    }
+  }
+  return { hits: [...new Set(hits)].slice(0, 20), skipped, refs: tips.length };
+}
+
+/** The local folder must match what GitHub has, so the scan covers exactly what becomes public. */
+function sameAsGithub(root) {
+  const git = (args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  if (git(['status', '--porcelain'])) throw new UserError('커밋하지 않은 변경이 있어 공개로 바꾸지 않았습니다. 커밋·푸시한 뒤 다시 실행하세요 (GitHub에 올라간 내용을 검사해야 합니다).');
+  try {
+    execFileSync('git', ['-C', root, 'fetch', '--quiet', '--tags', 'origin'], { stdio: 'ignore', timeout: 120_000 });
+  } catch {
+    throw new UserError('GitHub에서 최신 기록을 받아오지 못해 공개로 바꾸지 않았습니다 (git fetch 실패). 인터넷·권한을 확인한 뒤 다시 실행하세요.');
+  }
+  let remoteHead = '';
+  try { remoteHead = git(['rev-parse', '--abbrev-ref', 'origin/HEAD']); } catch { remoteHead = ''; }
+  if (!remoteHead) for (const name of ['origin/main', 'origin/master']) { try { git(['rev-parse', '--verify', name]); remoteHead = name; break; } catch { /* next */ } }
+  if (!remoteHead) throw new UserError('GitHub 기본 브랜치를 찾지 못해 공개로 바꾸지 않았습니다.');
+  if (git(['rev-parse', 'HEAD']) !== git(['rev-parse', remoteHead])) throw new UserError(`이 폴더가 GitHub(${remoteHead})와 다릅니다. 푸시하거나 받아온(pull) 뒤 다시 실행하세요. 공개로 바꾸지 않았습니다.`);
+}
+
+async function makePublic(project, url, check, options) {
+  const name = repoName(check, url);
+  const local = gitRepo(options.folder);
+  const root = gitRoot(options.folder);
+  if (!local || !root || `${local.owner}/${local.repo}` !== name.toLowerCase()) {
+    throw new UserError(`공개 전환은 ${name} 저장소 폴더 안에서 실행해야 합니다 (그 저장소의 커밋을 먼저 검사합니다).`);
+  }
+  sameAsGithub(root);
+  const { hits, skipped, refs } = scanCommittedSecrets(root);
+  if (hits.length) {
+    throw new UserError([`키·비밀번호로 보이는 내용이 커밋돼 있어 공개로 바꾸지 않았습니다 (${hits.length}곳):`, ...hits.map((hit) => `  - ${hit}`), '지우고 커밋·푸시한 뒤 다시 실행하거나, 공개하지 않고 kch-ai repo 로 읽기 연결만 하세요.'].join('\n'));
+  }
+  try {
+    execFileSync('gh', ['--version'], { stdio: 'ignore' });
+  } catch {
+    throw new UserError('GitHub CLI(gh)가 없어 공개로 바꾸지 못했습니다. GitHub 웹의 저장소 Settings → General → Danger Zone → Change visibility 에서 바꾼 뒤 kch-ai repo 를 다시 실행하세요. 또는 공개하지 않고 kch-ai repo 로 읽기 연결만 하세요.');
+  }
+  const summary = [
+    `저장소 ${name} 를 공개로 바꿉니다. 인터넷의 누구나 코드를 볼 수 있게 됩니다.`,
+    `  키·비밀번호 검사: 브랜치·태그 ${refs}곳의 커밋된 파일에서 발견되지 않음`,
+    ...(skipped.length ? [`  검사하지 못한 큰 파일 ${skipped.length}개: ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ' 외' : ''} (직접 확인하세요)`] : []),
+    '  예전 커밋 기록(지금 브랜치·태그 끝이 아닌 커밋)에 남은 키는 검사하지 못합니다. 의심되면 공개하지 말고 kch-ai repo 로 읽기 연결만 하세요.',
+  ].join('\n');
+  if (!options.yes) {
+    if (!process.stdin.isTTY) throw new UserError(`확인이 필요합니다:\n${summary}\n사용자가 "공개"에 직접 동의한 경우에만 같은 명령에 --yes 를 붙여 다시 실행하세요.`, 2);
+    if ((await ask(`${summary}\n진행하려면 "공개"라고 입력하세요: `)) !== '공개') throw new UserError('취소했습니다. 아무것도 바뀌지 않았습니다.', 0);
+  }
+  try {
+    execFileSync('gh', ['repo', 'edit', name, '--visibility', 'public', '--accept-visibility-change-consequences'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  } catch (error) {
+    throw new UserError(`공개로 바꾸지 못했습니다 (저장소 관리 권한이 필요합니다): ${String(error?.stderr || error?.message || '').trim().slice(0, 300)}`);
+  }
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await new Promise((done) => setTimeout(done, 2000));
+    const after = await checkRepo(project.id, url).catch(() => null);
+    if (after?.state === 'ok') {
+      await authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url } }).catch(() => null);
+      return `${name} 를 공개로 바꿨습니다. AI 수준 판단이 이제 코드를 읽습니다 (다음 판단부터 반영).`;
+    }
+  }
+  return `${name} 를 공개로 바꿨습니다. GitHub 반영에 시간이 걸리는 중이라 잠시 뒤 kch-ai repo 로 다시 확인해 주세요.`;
+}
+
+/** kch-ai repo [--public]: make sure the AI 수준 judgment can read this project's repository. */
+async function opRepo(options) {
+  const profile = await me();
+  const project = await requireProject(options, profile);
+  const local = gitRepo(options.folder);
+  let url = project.repo?.url || (project.repo ? `https://github.com/${project.repo.owner}/${project.repo.repo}` : null);
+  if (!url && local) {
+    await confirm(`${project.title} 에 이 폴더의 저장소를 연결합니다: ${local.url}`, options);
+    await authed('PUT', `/projects/${encodeURIComponent(project.id)}/repo`, { body: { url: local.url } });
+    url = local.url;
+  }
+  if (!url) throw new UserError('이 프로젝트에 연결된 GitHub 저장소가 없습니다. 저장소 폴더에서 실행하거나 웹 프로젝트 화면에서 저장소를 연결하세요.');
+  const check = await checkRepo(project.id, url);
+  const name = repoName(check, url);
+  if (check.state === 'ok' && await saveVerifiedLink(project, url, check)) {
+    return `저장소 ${name}: ${check.private ? '비공개 · 읽기 연결됨' : '공개'}. AI 수준 판단이 코드를 읽을 수 있습니다.`;
+  }
+  if (check.state === 'ok') throw new UserError(`저장소 ${name} 를 읽을 수는 있지만 연결을 확정하지 못했습니다. 잠시 뒤 kch-ai repo 를 다시 실행하세요.`);
+  if (check.state !== 'need_login' && check.state !== 'no_access') {
+    throw new UserError(`저장소 ${name} 를 확인하지 못했습니다 (${check.state}). 주소를 확인하거나 잠시 뒤 다시 실행하세요.`);
+  }
+  if (options.public) return makePublic(project, url, check, options);
+  const verifyUrl = `${serverUrl()}/github-installed?start=verify`;
+  const steps = [
+    `저장소 ${name} 를 비공개로 둔 채 AI 수준 판단이 읽을 수 있게 연결합니다 (읽기만 하고 코드를 바꾸지 않습니다).`,
+    `  1) 브라우저에 GitHub 앱 승인 화면이 열립니다. "Only select repositories"에서 ${name} 를 고르고 Install 을 누르세요.`,
+    '     (회사 Organization 저장소는 조직 관리자의 승인이 필요할 수 있습니다)',
+    '  2) 설치가 끝나면 KCH AI 현황관리로 돌아와 GitHub 계정 확인(Authorize)으로 바로 이어집니다.',
+    `  앱이 이미 설치돼 있으면 이 주소만 열면 됩니다: ${verifyUrl}`,
+  ];
+  console.log(steps.join('\n'));
+  if (check.install_url) {
+    console.log(`  GitHub 앱 승인 화면: ${check.install_url}`);
+    if (!options.noBrowser) openBrowser(check.install_url);
+  } else if (!options.noBrowser) {
+    openBrowser(verifyUrl);
+  }
+  if (options.noWait) return '승인을 마친 뒤 kch-ai repo 를 다시 실행하면 연결을 확인합니다.';
+  // AI tools usually stop a command after about 2 minutes: wait 90 s there, 10 min in a real terminal (or with --wait).
+  const waitMs = options.wait || process.stdout.isTTY ? REPO_WAIT_MS : 90_000;
+  const done = await waitReadable(project, url, { verifyUrl, noBrowser: options.noBrowser, waitMs });
+  if (done) return `연결됐습니다. 저장소 ${name}: 비공개 · 읽기 연결됨. AI 수준 판단이 코드를 읽습니다 (다음 판단부터 반영).`;
+  if (waitMs < REPO_WAIT_MS) return `아직 승인이 끝나지 않았습니다. 사용자가 GitHub에서 Install·Authorize 를 마치면 kch-ai repo 를 다시 실행하세요.\n  앱 승인: ${check.install_url || '(웹 프로젝트 화면의 저장소 칸)'}\n  계정 확인: ${verifyUrl}`;
+  throw new UserError(`10분 안에 연결이 확인되지 않았습니다. GitHub에서 승인을 마친 뒤 kch-ai repo 를 다시 실행하세요.\n  앱 승인: ${check.install_url || '(웹 프로젝트 화면의 저장소 칸)'}\n  계정 확인: ${verifyUrl}`);
 }
 
 /* ---------------- CLI ---------------- */
@@ -764,6 +1002,8 @@ const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
   show                                  이 폴더 프로젝트의 지금 내용 (없으면 '아직 없음')
   list                                  내 프로젝트 목록
   attach 파일...                        저장소 밖 파일 첨부 (정리 문서 필요, 정리 문서도 함께 올라감)
+  repo                                  AI 수준 판단이 이 저장소 코드를 읽게 연결 (비공개 유지, GitHub 승인 화면 열림)
+  repo --public                         저장소를 공개로 전환 (키·비밀번호 검사 후, gh 필요)
 
   모든 등록·업데이트는 kch-ai-project.md 를 고친 뒤 apply 로 합니다 (진행 상태 하나만 바꿀 때도).
   undo                                  마지막 변경 되돌리기 (24시간 안)
@@ -781,6 +1021,9 @@ function parseArgs(argv) {
     const eq = arg.indexOf('=');
     if (arg === '--yes' || arg === '-y') options.yes = true;
     else if (arg === '--no-browser') options.noBrowser = true;
+    else if (arg === '--public') options.public = true;
+    else if (arg === '--no-wait') options.noWait = true;
+    else if (arg === '--wait') options.wait = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg.startsWith('--') && eq > 2 && VALUE_FLAGS.has(arg.slice(2, eq))) options[arg.slice(2, eq)] = arg.slice(eq + 1);
     else if (arg.startsWith('--') && VALUE_FLAGS.has(arg.slice(2))) options[arg.slice(2)] = argv[++index] ?? '';
@@ -791,7 +1034,7 @@ function parseArgs(argv) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const aliases = { 정리: 'sheet', 반영: 'apply', sentence: 'profile', status: 'profile', setup: 'login', ls: 'list', 등록: 'new', 업데이트: 'profile', 보기: 'show', 첨부: 'attach', 되돌리기: 'undo' };
+  const aliases = { 저장소: 'repo', 정리: 'sheet', 반영: 'apply', sentence: 'profile', status: 'profile', setup: 'login', ls: 'list', 등록: 'new', 업데이트: 'profile', 보기: 'show', 첨부: 'attach', 되돌리기: 'undo' };
   const raw = options._[0] || 'help';
   const command = aliases[raw] || raw;
   const rest = options._.slice(1);
@@ -839,6 +1082,8 @@ async function main() {
       return console.log(await opAttach({ ...options, files: rest }));
     case 'undo':
       return console.log(await opUndo(options));
+    case 'repo':
+      return console.log(await opRepo(options));
     default:
       throw new UserError(`알 수 없는 명령입니다: ${raw}\n\n${HELP}`);
   }

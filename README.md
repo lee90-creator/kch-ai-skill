@@ -67,6 +67,7 @@ That's it. Your AI writes a project document, shows you exactly what will change
 | "Add 김혜민 as QA" | Adds a teammate line → finds them in the company directory → posts it |
 | "Attach this screenshot" | Adds the file to the document's attachment list → uploads it with the document |
 | "Undo that" | Reverts this PC's last change (within 24 hours, and only if nobody edited it since) |
+| "Let it read my private repo" | Opens the GitHub app approval for this repository (it stays private) and waits until KCH AI Status can read the code |
 
 Not done by the skill (use the website): removing teammates, deleting attachments, renaming a project.
 
@@ -125,6 +126,8 @@ Full instructions are in [`SKILL.md`](SKILL.md). The tool is `scripts/kch-ai.mjs
 | `show` / `list` | Read-only: this folder's project / all my projects |
 | `attach <file> --yes` | Upload a file from outside the repo (requires the document; uploads it too) |
 | `undo` | Revert this PC's last change |
+| `repo` | Let KCH AI Status read this repository's code while it stays private (opens the GitHub app approval, waits up to 10 min) |
+| `repo --public` | Make the repository public after a key/password scan of tracked files (stops for confirmation; needs `gh`) |
 | `login` / `logout` / `whoami` | Connection |
 
 Direct-change commands (`new`, `profile`) are refused on purpose: every change goes through the document.
