@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.5.1';
+const VERSION = '1.5.2';
 const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
 // The service moved (2026-10-12); a config saved with the old address follows it.
 const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
@@ -1166,9 +1166,17 @@ function buildPack(root) {
       raw = readFileSync(full, 'utf8');
     } catch { continue; }
     if (raw.includes('\u0000')) continue;
-    const cap = Math.min(/\.html?$/i.test(path) ? PACK_HTML_CHARS : PACK_FILE_CHARS, left);
+    // Single-file tools (the whole app inside <script>) are code: code budget, <style> blocks dropped (same rule as the site).
+    let source = raw.replace(/\r\n/g, '\n');
+    let heavy = false;
+    if (/\.html?$/i.test(path)) {
+      const scripts = [...source.matchAll(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].reduce((sum, match) => sum + match[1].trim().length, 0);
+      heavy = scripts >= 3000 || (source.length > 0 && scripts / source.length >= 0.3);
+      if (heavy) source = source.replace(/(<style\b[^>]*>)[\s\S]*?(<\/style>)/gi, '$1/* 스타일 생략 */$2');
+    }
+    const cap = Math.min(/\.html?$/i.test(path) && !heavy ? PACK_HTML_CHARS : PACK_FILE_CHARS, left);
     if (cap <= 200) break;
-    const { content, excerpted } = packExcerpt(maskPack(raw.replace(/\r\n/g, '\n')), cap);
+    const { content, excerpted } = packExcerpt(maskPack(source), cap);
     left -= content.length;
     const longest = Math.max(3, ...(content.match(/`{3,}/g) ?? []).map((run) => run.length));
     const fence = '`'.repeat(longest + 1);
