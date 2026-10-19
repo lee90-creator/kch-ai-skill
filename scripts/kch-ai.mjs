@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.5.2';
+const VERSION = '1.6.0';
 const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
 // The service moved (2026-10-12); a config saved with the old address follows it.
 const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
@@ -454,6 +454,7 @@ const SHEET_SECTIONS = [
   { key: 'progress_text', match: /^\s*(지금|제한)/, title: '지금 되는 부분이나 제한' },
   { key: 'future_text', match: /^\s*앞으로/, title: '앞으로 할 일' },
   { key: 'people', match: /^\s*(함께|담당자|참여자)/, title: '함께 하는 사람' },
+  { key: 'saving', match: /^\s*줄어든/, title: '줄어든 시간 (사람 손이 들던 시간이 얼마나 줄었나)' },
   { key: 'files', match: /^\s*첨부/, title: '첨부' },
   { key: 'notes', match: /^\s*(참고|메모|상세)/, title: '참고 (현황관리 입력칸에는 들어가지 않고, 이 문서 첨부로만 공유)' },
 ];
@@ -464,21 +465,32 @@ function renderSheet(data) {
     '',
     `- 진행 상태: ${data.stage_label || '개발 중'}`,
     `- 내 역할: ${(data.my_roles || []).map(roleLabel).join(', ')}`,
+    `- 운영 방식: ${data.run_mode ? RUN_MODE_LABELS[data.run_mode] : ''}`,
     '',
   ];
   for (const section of SHEET_SECTIONS) {
     lines.push(`## ${section.title}`, '');
     if (section.key === 'people') for (const person of data.people || []) lines.push(`- ${person.name} (${person.department}): ${person.roles.map(roleLabel).join(', ')}`);
+    else if (section.key === 'saving') {
+      const saving = data.saving || null;
+      lines.push(
+        `- 예전 1회: ${saving ? minutesText(saving.minutes_before) : ''}`,
+        `- 지금 1회: ${saving ? minutesText(saving.minutes_after) : ''}`,
+        `- 횟수: ${saving ? saving.frequency_text || `월 ${saving.times_per_month}회` : ''}`,
+        `- 누구 시간: ${saving ? peopleText(saving.people, saving.extra_people) : ''}`,
+        `- 근거: ${saving ? (saving.basis === 'measured' ? '직접 잼' : '추정') : ''}`,
+      );
+    }
     else if (section.key === 'files') for (const file of data.files || []) lines.push(`- ${file}`);
     else if (data[section.key]) lines.push(data[section.key]);
     lines.push('');
   }
-  lines.push('<!-- kch-ai 스킬이 이 문서를 기준으로 KCH AI 현황관리에 반영합니다. 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료. 역할: 기획 / 개발 / QA / 현업 담당 / 운영. 첨부 경로는 이 문서 기준. 비밀번호·키·개인정보 금지. -->');
+  lines.push('<!-- kch-ai 스킬이 이 문서를 기준으로 KCH AI 현황관리에 반영합니다. 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료. 역할: 기획 / 개발 / QA / 현업 담당 / 운영. 운영 방식: AI 없이 프로그램·로봇만 / 일부 단계만 AI / 매번 AI. 줄어든 시간: 1회에 사람 손이 드는 시간(예: 3시간, 1시간 30분, 10분), 횟수(월 4회, 주 2회, 매일), 누구 시간(나, 참여자 이름, 외 N명), 근거(직접 잼 / 추정). 첨부 경로는 이 문서 기준. 비밀번호·키·개인정보 금지. -->');
   return `${lines.join('\n')}\n`;
 }
 
 function parseSheet(text) {
-  const sheet = { title: '', stage: null, my_roles: null, fields: {}, people: [], files: [], notes: '' };
+  const sheet = { title: '', stage: null, my_roles: null, run_mode: null, fields: {}, people: [], files: [], notes: '', saving: null };
   let section = null;
   const buffer = {};
   for (const raw of text.replace(/<!--[\s\S]*?-->/g, '').split(/\r?\n/)) {
@@ -491,9 +503,10 @@ function parseSheet(text) {
       continue;
     }
     if (!section) {
-      const meta = /^[-*]\s*(진행\s*상태|내\s*역할)\s*[:：]\s*(.*)$/.exec(line.trim());
+      const meta = /^[-*]\s*(진행\s*상태|내\s*역할|운영\s*방식)\s*[:：]\s*(.*)$/.exec(line.trim());
       if (meta && /진행/.test(meta[1])) sheet.stage = meta[2].trim();
       if (meta && /역할/.test(meta[1])) sheet.my_roles = meta[2].trim();
+      if (meta && /운영/.test(meta[1])) sheet.run_mode = meta[2].trim();
       continue;
     }
     buffer[section].push(line);
@@ -513,7 +526,118 @@ function parseSheet(text) {
     const match = /^[-*]\s*(.+)$/.exec(line.trim());
     if (match) sheet.files.push(match[1].replace(/^`|`$/g, '').trim());
   }
+  if (buffer.saving) {
+    const raw = {};
+    for (const line of buffer.saving) {
+      const match = /^[-*]\s*([^:：]+?)\s*[:：]\s*(.*)$/.exec(line.trim());
+      if (!match) continue;
+      const key = match[1].replace(/\s+/g, '');
+      if (/^예전/.test(key)) raw.before = match[2].trim();
+      else if (/^지금/.test(key)) raw.after = match[2].trim();
+      else if (/^횟수|^빈도|^얼마나자주/.test(key)) raw.frequency = match[2].trim();
+      else if (/^누구/.test(key)) raw.people = match[2].trim();
+      else if (/^근거/.test(key)) raw.basis = match[2].trim();
+    }
+    sheet.saving = raw;
+  }
   return sheet;
+}
+
+/* ---------------- 줄어든 시간 · 운영 방식 (1.6.0) ---------------- */
+
+const RUN_MODE_LABELS = { none: 'AI 없이 프로그램·로봇만', partial: '일부 단계만 AI', every: '매번 AI' };
+
+function runModeOf(text) {
+  const value = String(text || '').replace(/\s+/g, '');
+  if (!value) return null;
+  if (/일부|단계만|가끔|부분/.test(value)) return 'partial';
+  if (/매번|항상|모든|전부/.test(value)) return 'every';
+  if (/없이|안씀|안써|없음|미사용|로봇|프로그램만|규칙/.test(value)) return 'none';
+  throw new UserError(`운영 방식 "${text}"를 알 수 없습니다. AI 없이 프로그램·로봇만 / 일부 단계만 AI / 매번 AI 중 하나로 적어 주세요.`);
+}
+
+function minutesText(value) {
+  if (value === null || value === undefined) return '';
+  if (value >= 60) return value % 60 ? `${Math.floor(value / 60)}시간 ${value % 60}분` : `${value / 60}시간`;
+  return `${value}분`;
+}
+
+/** "3시간", "1시간 30분", "90분", "2.5시간", "0분" → minutes. */
+function parseMinutes(text, label) {
+  const value = String(text || '').replace(/\s+/g, '').replace(/약|대략|정도|쯤|이내|~/g, '');
+  if (/^0(분|시간)?$/.test(value) || /^없음|^0$/.test(value)) return 0;
+  const match = /^(?:(\d+(?:\.\d+)?)(?:시간|h|hr|hrs))?(?:(\d+(?:\.\d+)?)(?:분|m|min))?$/i.exec(value);
+  if (!value || !match || (match[1] === undefined && match[2] === undefined)) throw new UserError(`줄어든 시간의 "${label}"을(를) 읽지 못했습니다: "${text}". 예: 3시간, 1시간 30분, 10분`);
+  return Math.round(Number(match[1] || 0) * 60 + Number(match[2] || 0));
+}
+
+/** "월 4회", "주 2회", "매일", "일 3회", "연 12회", "분기 1회", "매주", "매월" → times a month (21 work days, 4.33 weeks). */
+function parseFrequency(text) {
+  const value = String(text || '').replace(/\s+/g, '').replace(/약|대략|정도|쯤/g, '');
+  const per = { 월: 1, 매월: 1, 한달: 1, 달: 1, 주: 4.33, 매주: 4.33, 일: 21, 매일: 21, 하루: 21, 평일: 21, 영업일: 21, 연: 1 / 12, 년: 1 / 12, 매년: 1 / 12, 분기: 1 / 3 };
+  const match = /^(매월|한달|월|달|매주|주|매일|하루|평일|영업일|일|매년|연|년|분기)(?:에|마다)?(\d+(?:\.\d+)?)?(?:회|번)?$/.exec(value);
+  if (!match || (!match[2] && !/^매|^평일|^영업일/.test(match[1]))) throw new UserError(`줄어든 시간의 "횟수"를 읽지 못했습니다: "${text}". 예: 월 4회, 주 2회, 매일, 일 3회`);
+  const count = Number(match[2] || 1);
+  const times = Math.round(count * per[match[1]] * 100) / 100;
+  if (!(times > 0)) throw new UserError(`줄어든 시간의 "횟수"는 0보다 커야 합니다: "${text}"`);
+  return { times, text: String(text).trim() };
+}
+
+/** "나, 김혜민 외 3명" → { names: ['나', '김혜민'], extra: 3 }. */
+function parseBeneficiaries(text) {
+  const names = [];
+  let extra = 0;
+  for (const part of String(text || '').split(/[,，、·]/).map((item) => item.trim()).filter(Boolean)) {
+    const more = /^(?:(.*?)\s*)?(?:외|그\s*밖에|그밖에|및)?\s*(\d+)\s*명$/.exec(part);
+    if (more) {
+      // "팀원 3명", "직원 90명": a group word, not a name.
+      const name = (more[1] || '').trim().replace(/^(팀원|팀|직원|담당자|현업|사용자|사원|전\s*직원)$/, '');
+      if (name) names.push(name);
+      extra += Number(more[2]);
+      continue;
+    }
+    names.push(part.replace(/\s*\(.*\)$/, ''));
+  }
+  if (!names.length && !extra) throw new UserError('줄어든 시간의 "누구 시간"을 적어 주세요. 예: 나 / 나, 김혜민 / 나 외 3명');
+  return { names: [...new Set(names)], extra };
+}
+
+function peopleText(people, extra) {
+  const names = (people || []).map((person) => person.name);
+  return [names.join(', '), extra ? `${names.length ? '외 ' : ''}${extra}명` : ''].filter(Boolean).join(' ');
+}
+
+/** The sheet's 줄어든 시간 section as the server body, or null when it is left empty. */
+function savingOf(raw) {
+  if (!raw || !Object.values(raw).some((value) => String(value || '').trim())) return null;
+  const missing = [['before', '예전 1회'], ['after', '지금 1회'], ['frequency', '횟수'], ['people', '누구 시간']].filter(([key]) => !String(raw[key] || '').trim()).map(([, label]) => label);
+  if (missing.length) throw new UserError(`줄어든 시간 칸을 다 채우거나 모두 비워 주세요. 빈 칸: ${missing.join(', ')}`);
+  const before = parseMinutes(raw.before, '예전 1회');
+  const after = parseMinutes(raw.after, '지금 1회');
+  if (after > before) throw new UserError(`줄어든 시간: 지금 1회(${minutesText(after)})가 예전(${minutesText(before)})보다 깁니다. 사람 손이 드는 시간으로 적어 주세요.`);
+  const frequency = parseFrequency(raw.frequency);
+  const who = parseBeneficiaries(raw.people);
+  // Only explicit words mean measured ("현재 추정" must stay 추정).
+  const basisText = String(raw.basis || '');
+  const basis = !/추정|예상|대략/.test(basisText) && /직접\s*잼|직접\s*재|재\s*봄|재어|잰|실측|측정|타이머|기록으로/.test(basisText) ? 'measured' : 'estimated';
+  return { minutes_before: before, minutes_after: after, times_per_month: frequency.times, frequency_text: frequency.text, people: who.names, extra_people: who.extra, basis };
+}
+
+function savingSummary(saving, myName) {
+  const names = saving.people.map((name) => (name === myName ? '나' : name));
+  const people = names.length + saving.extra_people;
+  const monthly = Math.round(Math.max(0, saving.minutes_before - saving.minutes_after) * saving.times_per_month) * people;
+  return `${minutesText(saving.minutes_before)} → ${minutesText(saving.minutes_after)} · ${saving.frequency_text} · ${[names.join(', '), saving.extra_people ? `${names.length ? '외 ' : ''}${saving.extra_people}명` : ''].filter(Boolean).join(' ')} · ${saving.basis === 'measured' ? '직접 잼' : '추정'} (한 달에 약 ${minutesText(monthly)} 줄어듦)`;
+}
+
+/** Same as what is stored? (names compared after "나" → my name) */
+function sameSaving(stored, next, myName) {
+  if (!stored && !next) return true;
+  if (!stored || !next) return false;
+  const names = (list) => [...new Set(list.map((name) => (name === '나' ? myName : name)))].sort().join('|');
+  return stored.minutes_before === next.minutes_before && stored.minutes_after === next.minutes_after && Number(stored.times_per_month) === next.times_per_month
+    && (stored.frequency_text || '') === next.frequency_text && stored.extra_people === next.extra_people && stored.basis === next.basis
+    && names(stored.people.map((person) => person.name)) === names(next.people);
 }
 
 async function staffOf(projectId) {
@@ -589,10 +713,14 @@ async function opSheet(options) {
   const staff = await staffOf(project.id);
   const mine = staff.find((row) => row.name === profile.name && row.department === profile.department);
   const files = (await attachmentsOf(project.id)).map((file) => file.name).filter((name) => name !== SHEET_NAME);
+  const timeSaving = (await authed('GET', `/projects/${encodeURIComponent(project.id)}/time-saving`).catch(() => ({ time_saving: null }))).time_saving;
+  const saving = timeSaving?.saving ? { ...timeSaving.saving, people: timeSaving.saving.people.map((person) => (person.name === profile.name ? { ...person, name: '나' } : person)) } : null;
   return renderSheet({
     title: project.title,
     stage_label: project.stage_label,
     my_roles: mine?.roles || [],
+    run_mode: timeSaving?.run_mode || null,
+    saving,
     after: answers.after, now: answers.now, progress_text: answers.progress_text, future_text: answers.future_text,
     people: staff.filter((row) => row !== mine).map((row) => ({ name: row.name, department: row.department, roles: row.roles || [] })),
     files: files.length ? files.map((name) => `${name}  (이미 올라가 있음)`) : [],
@@ -615,6 +743,9 @@ async function opApply(options) {
   const fields = PROFILE_FIELDS.filter((field) => sheet.fields[field.key] !== undefined).map((field) => ({ ...field, value: checkText(sheet.fields[field.key], field.label, field.max) }));
   if (!fields.find((field) => field.key === 'after')?.value) throw new UserError('"어떤 일을 편하게 하나요 (한 문장)" 칸은 꼭 채워 주세요.');
   const myRoles = sheet.my_roles === null ? null : parseRoles(sheet.my_roles, '내 역할');
+  // 운영 방식 and 줄어든 시간 (1.6.0): left empty → nothing changes.
+  const runMode = runModeOf(sheet.run_mode);
+  const saving = savingOf(sheet.saving);
   const files = sheet.files.map((file) => file.replace(/\s+\(이미 올라가 있음\)$/, '')).filter(Boolean);
   const profile = await me();
   const meRow = (await authed('GET', `/staff/search?q=${encodeURIComponent(profile.name)}`)).staff?.find((person) => person.name === profile.name && person.department === profile.department);
@@ -658,6 +789,17 @@ async function opApply(options) {
     if (!row) plan.push(`함께 하는 사람 추가: ${person.name} (${person.department}) · ${person.roles.map(roleLabel).join(', ') || '역할 없음'}`);
     else if (JSON.stringify([...(row.roles || [])].sort()) !== JSON.stringify([...person.roles].sort())) plan.push(`역할 변경: ${person.name} ${(row.roles || []).map(roleLabel).join(', ') || '(없음)'} → ${person.roles.map(roleLabel).join(', ') || '(없음)'}`);
   }
+  // Whose time: "나" or people on this project (listed in the sheet or already on the project).
+  if (saving) {
+    const known = new Set([profile.name, '나', ...people.map((person) => person.name), ...staff.map((row) => row.name)]);
+    const strangers = saving.people.filter((name) => !known.has(name));
+    if (strangers.length) throw new UserError(`줄어든 시간의 "누구 시간"에 참여자가 아닌 사람이 있습니다: ${strangers.join(', ')}. ## 함께 하는 사람에 넣거나 "외 N명"으로 적어 주세요.`);
+  }
+  const storedTime = project ? (await authed('GET', `/projects/${encodeURIComponent(project.id)}/time-saving`).catch(() => ({ time_saving: null }))).time_saving : null;
+  const runModeChanged = runMode !== null && runMode !== (storedTime?.run_mode ?? null);
+  const savingChanged = saving !== null && !sameSaving(storedTime?.saving ?? null, saving, profile.name);
+  if (runModeChanged) plan.push(`운영 방식: ${storedTime?.run_mode ? RUN_MODE_LABELS[storedTime.run_mode] : '(비어 있음)'} → ${RUN_MODE_LABELS[runMode]}`);
+  if (savingChanged) plan.push(`줄어든 시간: ${savingSummary(saving, profile.name)}`);
   const notListed = staff.filter((row) => row.employee_id !== meRow?.id && !people.some((person) => person.id === row.employee_id));
   const uploads = [];
   const kept = [];
@@ -776,6 +918,12 @@ async function opApply(options) {
     else if (JSON.stringify([...(row.roles || [])].sort()) !== JSON.stringify([...person.roles].sort())) {
       await step(`${person.name} 역할`, () => authed('PATCH', `/projects/${encodeURIComponent(project.id)}/staff/${encodeURIComponent(person.id)}`, { body: { roles: person.roles, expected_version: row.version } }));
     }
+  }
+  // After the people are on the project: whose time it saves must be participants.
+  if (runModeChanged || savingChanged) {
+    await step('줄어든 시간·운영 방식', () => authed('PUT', `/projects/${encodeURIComponent(project.id)}/time-saving`, {
+      body: { ...(runModeChanged ? { run_mode: runMode } : {}), ...(savingChanged ? { saving: { ...saving, people: saving.people.map((name) => (name === profile.name ? '나' : name)) } } : {}) },
+    }));
   }
   for (const upload of uploads) await step(`첨부 ${basename(upload.file)}`, () => uploadFile(project, upload.file, upload.existing));
   if (pack) await step('제출 코드 묶음', () => uploadPack(project.id, pack));
