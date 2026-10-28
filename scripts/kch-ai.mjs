@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.6.0';
+const VERSION = '1.7.0';
 const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
 // The service moved (2026-10-12); a config saved with the old address follows it.
 const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
@@ -78,6 +78,22 @@ const serverUrl = (options = {}) => {
 
 /* ---------------- http ---------------- */
 
+/** x.y.z: a older than b? */
+function olderThan(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i += 1) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0);
+  return false;
+}
+let updateTold = false;
+/** The server names the current release on every reply (1.7.0): say once when this copy is older. */
+function noticeUpdate(response) {
+  const latest = response.headers.get('x-kch-ai-latest');
+  if (updateTold || !latest || !/^\d+\.\d+\.\d+$/.test(latest) || !olderThan(VERSION, latest)) return;
+  updateTold = true;
+  log(`알림: kch-ai 새 버전 ${latest}이 있습니다 (지금 ${VERSION}). AI에게 "kch-ai 스킬 업데이트해줘"라고 말하면 됩니다.`);
+}
+
 async function call(method, path, { body, token, server, raw, contentType } = {}) {
   const headers = { Accept: 'application/json', 'User-Agent': `kch-ai/${VERSION}` };
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -95,6 +111,7 @@ async function call(method, path, { body, token, server, raw, contentType } = {}
   } catch (error) {
     throw new UserError(`서버(${server})에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요. AI 도구의 샌드박스가 인터넷을 막고 있다면 샌드박스 밖 실행을 허용해 주세요. (${error?.cause?.code || error?.message || error})`);
   }
+  noticeUpdate(response);
   const text = await response.text();
   let data = null;
   try {
@@ -278,12 +295,18 @@ async function opShow(options) {
     ].join('\n');
   }
   const answers = (await authed('GET', `/projects/${encodeURIComponent(project.id)}/profile`)).profile.answers || {};
+  const materials = await authed('GET', `/projects/${encodeURIComponent(project.id)}/evidence`).catch(() => null);
+  const evidence = materials?.items || [];
+  const status = await statusLines(project.id);
   return [
     `프로젝트: ${project.title}`,
     `진행 상태: ${project.stage_label}`,
     ...PROFILE_FIELDS.map((field) => `${field.label}: ${answers[field.key] || '(비어 있음)'}`),
+    `쓰는 사람: ${materials?.usage_scope || '(비어 있음)'}`,
     `저장소: ${project.repo ? `${project.repo.owner}/${project.repo.repo}` : '(연결 안 됨)'}`,
+    `운영 증거(비공개): ${evidence.length ? evidence.map((item) => `${item.kind === 'image' ? '화면' : '기록'} ${item.name}`).join(', ') : '(없음)'}`,
     project.url,
+    ...(status ? [status] : []),
   ].join('\n');
 }
 
@@ -456,6 +479,8 @@ const SHEET_SECTIONS = [
   { key: 'people', match: /^\s*(함께|담당자|참여자)/, title: '함께 하는 사람' },
   { key: 'saving', match: /^\s*줄어든/, title: '줄어든 시간 (사람 손이 들던 시간이 얼마나 줄었나)' },
   { key: 'files', match: /^\s*첨부/, title: '첨부' },
+  // 1.7.0: run screens and run logs the person picks. Private (관리자 검토용), never an attachment.
+  { key: 'evidence', match: /^\s*운영\s*증거/, title: '운영 증거 (관리자 검토용 비공개, 직원에게 안 보임)' },
   { key: 'notes', match: /^\s*(참고|메모|상세)/, title: '참고 (현황관리 입력칸에는 들어가지 않고, 이 문서 첨부로만 공유)' },
 ];
 
@@ -466,6 +491,7 @@ function renderSheet(data) {
     `- 진행 상태: ${data.stage_label || '개발 중'}`,
     `- 내 역할: ${(data.my_roles || []).map(roleLabel).join(', ')}`,
     `- 운영 방식: ${data.run_mode ? RUN_MODE_LABELS[data.run_mode] : ''}`,
+    `- 쓰는 사람: ${data.usage || ''}`,
     '',
   ];
   for (const section of SHEET_SECTIONS) {
@@ -482,15 +508,16 @@ function renderSheet(data) {
       );
     }
     else if (section.key === 'files') for (const file of data.files || []) lines.push(`- ${file}`);
+    else if (section.key === 'evidence') for (const item of data.evidence || []) lines.push(`- ${item.kind === 'image' ? '실행 화면' : '실행 기록'}: ${item.name} · ${item.taken || ''} · ${item.note || ''}  (이미 올라가 있음)`);
     else if (data[section.key]) lines.push(data[section.key]);
     lines.push('');
   }
-  lines.push('<!-- kch-ai 스킬이 이 문서를 기준으로 KCH AI 현황관리에 반영합니다. 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료. 역할: 기획 / 개발 / QA / 현업 담당 / 운영. 운영 방식: AI 없이 프로그램·로봇만 / 일부 단계만 AI / 매번 AI. 줄어든 시간: 1회에 사람 손이 드는 시간(예: 3시간, 1시간 30분, 10분), 횟수(월 4회, 주 2회, 매일), 누구 시간(나, 참여자 이름, 외 N명), 근거(직접 잼 / 추정). 첨부 경로는 이 문서 기준. 비밀번호·키·개인정보 금지. -->');
+  lines.push('<!-- kch-ai 스킬이 이 문서를 기준으로 KCH AI 현황관리에 반영합니다. 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료. 역할: 기획 / 개발 / QA / 현업 담당 / 운영. 운영 방식: AI 없이 프로그램·로봇만 / 일부 단계만 AI / 매번 AI. 줄어든 시간: 1회에 사람 손이 드는 시간(예: 3시간, 1시간 30분, 10분), 횟수(월 4회, 주 2회, 매일), 누구 시간(나, 참여자 이름, 외 N명), 근거(직접 잼 / 추정). 쓰는 사람: 부서·인원·각자 계정인지 (예: 재무팀 5명이 각자 계정으로). 운영 증거: "- 실행 화면: 파일 · 날짜 · 무엇" / "- 실행 기록: 파일 · 날짜 · 무엇" (사용자가 고른 파일만, 비공개). 첨부 경로는 이 문서 기준. 비밀번호·키·개인정보 금지. -->');
   return `${lines.join('\n')}\n`;
 }
 
 function parseSheet(text) {
-  const sheet = { title: '', stage: null, my_roles: null, run_mode: null, fields: {}, people: [], files: [], notes: '', saving: null };
+  const sheet = { title: '', stage: null, my_roles: null, run_mode: null, usage: null, fields: {}, people: [], files: [], evidence: [], notes: '', saving: null };
   let section = null;
   const buffer = {};
   for (const raw of text.replace(/<!--[\s\S]*?-->/g, '').split(/\r?\n/)) {
@@ -503,10 +530,11 @@ function parseSheet(text) {
       continue;
     }
     if (!section) {
-      const meta = /^[-*]\s*(진행\s*상태|내\s*역할|운영\s*방식)\s*[:：]\s*(.*)$/.exec(line.trim());
+      const meta = /^[-*]\s*(진행\s*상태|내\s*역할|운영\s*방식|쓰는\s*사람)\s*[:：]\s*(.*)$/.exec(line.trim());
       if (meta && /진행/.test(meta[1])) sheet.stage = meta[2].trim();
       if (meta && /역할/.test(meta[1])) sheet.my_roles = meta[2].trim();
       if (meta && /운영/.test(meta[1])) sheet.run_mode = meta[2].trim();
+      if (meta && /쓰는/.test(meta[1])) sheet.usage = meta[2].trim();
       continue;
     }
     buffer[section].push(line);
@@ -526,6 +554,18 @@ function parseSheet(text) {
     const match = /^[-*]\s*(.+)$/.exec(line.trim());
     if (match) sheet.files.push(match[1].replace(/^`|`$/g, '').trim());
   }
+  // "- 실행 화면: 파일 · 날짜 · 무엇을 보여 주는지" / "- 실행 기록: ..."
+  for (const line of buffer.evidence || []) {
+    const text = line.trim();
+    if (!text || !/^[-*]/.test(text) || /^[-*]\s*\(?없음\)?$/.test(text)) continue;
+    const match = /^[-*]\s*(실행\s*화면|실행\s*기록|화면|기록|로그)\s*[:：]\s*(.+)$/.exec(text);
+    if (!match) throw new UserError(`운영 증거 줄을 읽지 못했습니다: "${text}". "- 실행 화면: 파일 · 날짜 · 무엇" 또는 "- 실행 기록: 파일 · 날짜 · 무엇" 형식으로 적어 주세요.`);
+    const already = /\(이미 올라가 있음\)\s*$/.test(match[2]);
+    const [file, taken = '', note = ''] = match[2].replace(/\s*\(이미 올라가 있음\)\s*$/, '').split(/\s+·\s+/).map((part) => part.replace(/^`|`$/g, '').trim());
+    sheet.evidence.push({ kind: /화면/.test(match[1]) ? 'image' : 'log', file, taken: taken.slice(0, 40), note: note.slice(0, 200), already });
+  }
+  // Without the heading (sheets from 1.6 and earlier) the stored 운영 증거 is left as it is.
+  sheet.evidenceSection = Boolean(buffer.evidence);
   if (buffer.saving) {
     const raw = {};
     for (const line of buffer.saving) {
@@ -640,6 +680,133 @@ function sameSaving(stored, next, myName) {
     && names(stored.people.map((person) => person.name)) === names(next.people);
 }
 
+/* ---------------- 운영 증거 · 가리기 · 기능↔코드 위치 (1.7.0) ---------------- */
+
+const EVIDENCE_LOG_CHARS = 30_000;
+const EVIDENCE_MAX_IMAGES = 4;
+const EVIDENCE_IMAGE_BYTES = 7_000_000;
+const EVIDENCE_IMAGE_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
+const EVIDENCE_LOG_EXT = /\.(log|txt|csv|json|jsonl|md|out)$/i;
+
+/** Same rules as the server (src/server/secrets.ts maskPersonal): numbered stand-ins, dates kept. */
+const foldDigits = (text) => text
+  .replace(/[\uFF10-\uFF19]/g, (d) => String.fromCharCode(d.charCodeAt(0) - 0xFF10 + 48))
+  .replace(/[\uFF0D\u2010-\u2015\u2212]/g, '-')
+  .replace(/\uFF20/g, '@').replace(/%40/gi, '@').replace(/%2D/gi, '-');
+const validDay = (mm, dd) => Number(mm) >= 1 && Number(mm) <= 12 && Number(dd) >= 1 && Number(dd) <= 31;
+const DATE_START = /^(?:19|20)\d{2}-\d{1,2}-\d{1,2}/;
+function maskPersonal(input) {
+  const kinds = {};
+  const hit = (kind) => { kinds[kind] = (kinds[kind] || 0) + 1; };
+  const numbered = new Map();
+  const standIn = (prefix, value) => {
+    const key = `${prefix}:${value.toLowerCase()}`;
+    if (!numbered.has(key)) numbered.set(key, `[${prefix}${[...numbered.keys()].filter((item) => item.startsWith(`${prefix}:`)).length + 1}]`);
+    return numbered.get(key);
+  };
+  let out = foldDigits(input);
+  out = out.replace(/https?:\/\/[^\s"'`<>)\]]+/g, (url) => url.replace(/(?<=[/=])(?=[A-Za-z0-9_-]{25,})(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{25,}/g, () => { hit('긴 ID'); return '[가림: ID]'; }));
+  out = out.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, (m) => { hit('메일'); return standIn('메일', m); });
+  out = out.replace(/(?<![\d-])(\d{2})(\d{2})(\d{2})\s?-?\s?([1-8])\d{6}(?![\d-])/g, (m, _yy, mm, dd) => { if (!validDay(mm, dd)) return m; hit('주민번호'); return '[가림: 주민번호]'; });
+  out = out.replace(/(?<![\d-])\d{3}-\d{2}-\d{5}(?![\d-])/g, () => { hit('사업자번호'); return '[가림: 사업자번호]'; });
+  out = out.replace(/(?<![\d-])(?:\+82[-. ]?0?(?:1\d|[2-6]\d?)|0\d{1,2})[-. ]?\d{3,4}[-. ]?\d{4}(?![\d-])/g, (m) => { if (DATE_START.test(m)) return m; hit('전화'); return standIn('전화', m.replace(/\D/g, '')); });
+  out = out.replace(/(?<![\d.-])\d{2,6}(?:-\d{2,7}){2,3}(?![\d.-])/g, (m) => { if (DATE_START.test(m)) return m; const digits = m.replace(/\D/g, '').length; if (digits < 10 || digits > 16) return m; hit('번호'); return '[가림: 번호]'; });
+  out = out.replace(/(?<![\d.])\d{11,16}(?![\d.])/g, (m) => {
+    // Timestamps stay: epoch ms/μs and compact dates (yyyyMMddHHmm[ss]).
+    if ((m.length === 13 || m.length === 16) && /^1[5-9]/.test(m)) return m;
+    if ((m.length === 12 || m.length === 14) && /^(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])(?:[01]\d|2[0-3])[0-5]\d/.test(m)) return m;
+    hit('번호'); return '[가림: 번호]';
+  });
+  return { text: out, kinds };
+}
+function residualPersonal(text) {
+  const left = [];
+  const folded = foldDigits(text);
+  for (const m of folded.matchAll(/(?<!\d)(\d{2})(\d{2})(\d{2})\s*[.\s_]\s*([1-8])\d{6}(?!\d)/g)) if (validDay(m[2], m[3])) { left.push('주민번호'); break; }
+  for (const m of folded.matchAll(/(?<![\d.])\d{3,6}(?:[ ._]\d{2,7}){2,3}(?![\d.])/g)) {
+    const digits = m[0].replace(/\D/g, '').length;
+    if (digits >= 11 && digits <= 16 && !/^(?:19|20)\d{2}[ ._]\d{1,2}[ ._]\d{1,2}/.test(m[0])) { left.push('계좌번호'); break; }
+  }
+  return left;
+}
+const kindsText = (kinds) => Object.entries(kinds).map(([kind, n]) => `${kind} ${n}`).join(', ');
+
+/** 기능 ↔ 코드 위치 written in ## 참고 as `src/robot.js › uploadToHometax` or (코드: src/robot.js › uploadToHometax). */
+function focusPathsOf(notes) {
+  const out = [];
+  const add = (path, part) => {
+    const clean = String(path).trim().replace(/^\.?[\\/]/, '').split('\\').join('/');
+    if (!clean || clean.includes('..') || !/\.[A-Za-z0-9]{1,6}$/.test(clean) || /\s/.test(clean)) return;
+    if (!out.some((item) => item.path === clean && item.part === (part || ''))) out.push({ path: clean, part: (part || '').trim().slice(0, 120) });
+  };
+  for (const match of String(notes || '').matchAll(/`([^`\n]+?)(?:\s*[›>]\s*([A-Za-z_$가-힣][\w$.가-힣-]*))?`/g)) add(match[1], match[2]);
+  for (const match of String(notes || '').matchAll(/코드\s*[:：]\s*([^\s`,)]+)(?:\s*[›>]\s*([A-Za-z_$가-힣][\w$.가-힣-]*))?/g)) add(match[1], match[2]);
+  return out.slice(0, 30);
+}
+
+/** The latest part of a log that fits (most recent runs), cut at a line boundary. */
+function tailLines(text, cap) {
+  const clean = text.replace(/\r\n/g, '\n').trimEnd();
+  if (clean.length <= cap) return { content: clean, lines: clean.split('\n').length, cut: false };
+  const lines = clean.split('\n');
+  const kept = [];
+  let used = 0;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].length > 600 ? `${lines[i].slice(0, 600)} …` : lines[i];
+    if (used + line.length + 1 > cap) break;
+    kept.unshift(line);
+    used += line.length + 1;
+  }
+  return { content: kept.join('\n'), lines: kept.length, cut: true };
+}
+
+/**
+ * The sheet's 운영 증거 as what will be sent: logs read, cut to the latest part, masked and checked;
+ * screens checked. Files are the ones the person listed (any folder): they stay private.
+ */
+function prepareEvidence(entries, baseDir, attachmentFiles, storedLogs = []) {
+  const items = [];
+  const fresh = entries.filter((entry) => !(entry.already && !existsSync(resolve(baseDir, entry.file))));
+  const logs = fresh.filter((entry) => entry.kind === 'log');
+  // Logs kept as they are still count toward the service's 30,000 characters.
+  const keptChars = entries.filter((entry) => entry.kind === 'log' && entry.already && !existsSync(resolve(baseDir, entry.file)))
+    .reduce((sum, entry) => sum + Number(storedLogs.find((row) => row.kind === 'log' && row.name === entry.file)?.size || 0), 0);
+  const share = logs.length ? Math.floor((EVIDENCE_LOG_CHARS - keptChars) / logs.length) - 200 : 0;
+  if (logs.length && share < 1000) throw new UserError('실행 기록이 너무 많습니다. 이미 올라간 기록을 빼거나 최근 것만 남겨 주세요.');
+  if (fresh.filter((entry) => entry.kind === 'image').length > EVIDENCE_MAX_IMAGES) throw new UserError(`운영 증거의 실행 화면은 ${EVIDENCE_MAX_IMAGES}장까지입니다. 가장 잘 보여 주는 것만 남겨 주세요.`);
+  for (const entry of entries) {
+    const file = resolve(baseDir, entry.file);
+    if (entry.already && !existsSync(file)) { items.push({ ...entry, keep: true }); continue; }
+    if (!existsSync(file) || !statSync(file).isFile()) throw new UserError(`운영 증거 파일을 찾을 수 없습니다: ${entry.file}`);
+    // A file chosen as private proof must not also go out as a public attachment (합의본 구현 확인).
+    if (attachmentFiles.some((listed) => resolve(baseDir, listed) === file)) {
+      throw new UserError(`${basename(file)} 이(가) ## 첨부(전 직원 공개)와 ## 운영 증거(비공개)에 모두 있습니다. 어느 쪽으로 보낼지 사용자에게 묻고 한 곳에만 남겨 주세요.`);
+    }
+    const name = basename(file).slice(0, 160);
+    if (entry.kind === 'image') {
+      const type = EVIDENCE_IMAGE_TYPES[extname(file).toLowerCase()];
+      if (!type) throw new UserError(`${name}: 실행 화면은 PNG·JPG·WEBP·GIF 이미지만 올릴 수 있습니다.`);
+      const bytes = readFileSync(file);
+      if (bytes.byteLength > EVIDENCE_IMAGE_BYTES) throw new UserError(`${name}: 실행 화면 한 장은 7MB까지입니다.`);
+      items.push({ kind: 'image', name, taken: entry.taken, note: entry.note, file, type, bytes, sha256: createHash('sha256').update(bytes).digest('hex') });
+      continue;
+    }
+    if (!EVIDENCE_LOG_EXT.test(file)) throw new UserError(`${name}: 실행 기록은 글자 파일(.log .txt .csv .json .md)만 올릴 수 있습니다. 화면이면 "실행 화면"으로 적어 주세요.`);
+    if (statSync(file).size > 20_000_000) throw new UserError(`${name}: 너무 큰 파일입니다. 최근 몇 번치만 따로 떼서 적어 주세요.`);
+    const raw = readFileSync(file, 'utf8');
+    if (raw.includes('\u0000')) throw new UserError(`${name}: 글자 파일이 아닙니다.`);
+    const tail = tailLines(raw, share);
+    const secret = maskPack(tail.content);
+    const personal = maskPersonal(secret);
+    const left = residualPersonal(personal.text);
+    if (left.length) throw new UserError(`${name}: 가린 뒤에도 ${left.join('·')}처럼 보이는 숫자가 남아 보내지 않았습니다. 그 줄을 지운 복사본을 적어 주세요.`);
+    if (!personal.text.trim()) throw new UserError(`${name}: 빈 파일입니다.`);
+    const secrets = secret === tail.content ? 0 : 1;
+    items.push({ kind: 'log', name, taken: entry.taken, note: entry.note, file, content: personal.text, lines: tail.lines, cut: tail.cut, kinds: { ...personal.kinds, ...(secrets ? { '키·비밀번호': 1 } : {}) }, sha256: createHash('sha256').update(personal.text).digest('hex') });
+  }
+  return items;
+}
+
 async function staffOf(projectId) {
   const rows = (await authed('GET', `/projects/${encodeURIComponent(projectId)}/staff`)).staff || [];
   return rows.filter((row) => row.active !== false);
@@ -715,7 +882,10 @@ async function opSheet(options) {
   const files = (await attachmentsOf(project.id)).map((file) => file.name).filter((name) => name !== SHEET_NAME);
   const timeSaving = (await authed('GET', `/projects/${encodeURIComponent(project.id)}/time-saving`).catch(() => ({ time_saving: null }))).time_saving;
   const saving = timeSaving?.saving ? { ...timeSaving.saving, people: timeSaving.saving.people.map((person) => (person.name === profile.name ? { ...person, name: '나' } : person)) } : null;
+  const materials = await authed('GET', `/projects/${encodeURIComponent(project.id)}/evidence`).catch(() => null);
   return renderSheet({
+    usage: materials?.usage_scope || '',
+    evidence: materials?.items || [],
     title: project.title,
     stage_label: project.stage_label,
     my_roles: mine?.roles || [],
@@ -747,6 +917,10 @@ async function opApply(options) {
   const runMode = runModeOf(sheet.run_mode);
   const saving = savingOf(sheet.saving);
   const files = sheet.files.map((file) => file.replace(/\s+\(이미 올라가 있음\)$/, '')).filter(Boolean);
+  // 1.7.0: 쓰는 사람 (left empty: unchanged), 기능 ↔ 코드 위치 from ## 참고, 운영 증거 (private).
+  const usage = sheet.usage ? checkText(sheet.usage, '쓰는 사람', 300) : null;
+  const focus = focusPathsOf(sheet.notes);
+
   const profile = await me();
   const meRow = (await authed('GET', `/staff/search?q=${encodeURIComponent(profile.name)}`)).staff?.find((person) => person.name === profile.name && person.department === profile.department);
   const resolvedPeople = (await resolvePeople(sheet.people, meRow?.id)).filter((person) => !person.me);
@@ -831,9 +1005,14 @@ async function opApply(options) {
       plan.push(`${named ? '첨부 새 버전' : '첨부 추가'}: ${basename(sheetPath)} (이 정리 문서)`);
     }
   }
-  // 제출 코드 묶음: when the judgment cannot read the code on GitHub, send this folder's code privately (unchanged code is not sent again).
+  // 제출 코드 묶음: when the judgment cannot read the code on GitHub, send the code privately (unchanged code is not sent again).
+  // 1.7.0: also outside a git folder (the sheet's folder when it holds code, or the folder given with --code), and
+  // code outside the repository (--add) next to a readable repository.
   let pack = null;
   let packHint = '';
+  const saved = project ? packStateOf(project.id) : {};
+  const codeRoot = options.code ? resolve(options.code) : saved.code && existsSync(saved.code) ? saved.code : null;
+  const addRoots = options.add ? String(options.add).split(/[;,]/).map((item) => item.trim()).filter(Boolean).map((item) => resolve(item)) : (saved.add || []).filter((item) => existsSync(item));
   if (!options.noPack) {
     const linked = project?.repo ? (project.repo.url || `https://github.com/${project.repo.owner}/${project.repo.repo}`) : repo?.url || null;
     let readable = false;
@@ -844,16 +1023,53 @@ async function opApply(options) {
         readable = check.state === 'ok' && (!check.private || !project || await saveVerifiedLink(project, linked, check));
       } catch { readable = false; }
     }
-    if (!readable && !root) {
-      // Outside a git folder the document may sit in Downloads or Desktop: never pack automatically there.
-      packHint = 'GitHub 없이 코드를 보내려면 프로젝트 코드가 있는 폴더에서 kch-ai pack 을 실행하세요.';
-    } else if (!readable) {
-      let built = null;
-      try { built = buildPack(root); } catch (error) { packHint = error instanceof UserError ? error.message : ''; }
-      const last = project ? lastPackFingerprint(project.id) : null;
-      if (built && built.files.length && built.fingerprint !== last) {
-        pack = built;
-        plan.push(`제출 코드 묶음 올리기: 코드 파일 ${built.files.length}개 (관리자 검토용 비공개 자료, 직원에게 안 보임${linked ? ', GitHub로 코드를 읽을 수 없어서' : ''})\n    ${packFileList(built)}`);
+    // Only a folder the person named (--code, remembered) or this git repository is packed automatically (Opus review 2026-10-28).
+    const folder = codeRoot || root;
+    let built = null;
+    if (!readable && !folder) {
+      // Never pack a folder nobody named (the document may sit in Downloads or Desktop): ask for the code folder.
+      packHint = `현황관리가 이 프로젝트 코드를 읽지 못하고 있습니다. 코드가 있는 폴더를 알려 주시면 비공개로 함께 보냅니다 (AI가 apply --code "코드 폴더"로 다시 실행${folderHasCode(baseDir) ? ', 이 문서 폴더가 코드 폴더면 --code .' : ''}).`;
+    } else if (!readable || addRoots.length) {
+      try { built = buildPack(readable ? null : folder, { focus, extra: addRoots }); } catch (error) { packHint = error instanceof UserError ? error.message : ''; }
+    }
+    const last = project ? lastPackFingerprint(project.id) : null;
+    if (built && built.files.length && built.fingerprint !== last) {
+      pack = { ...built, code: readable ? null : folder, add: addRoots };
+      const why = readable ? '저장소 밖 코드' : linked ? 'GitHub로 코드를 읽을 수 없어서' : '';
+      plan.push(`제출 코드 묶음 올리기: 코드 파일 ${built.files.length}개 (관리자 검토용 비공개 자료, 직원에게 안 보임${why ? `, ${why}` : ''})\n    폴더: ${[readable ? null : folder, ...addRoots].filter(Boolean).join(', ')}\n    ${packFileList(built)}`);
+    }
+  }
+  // 쓰는 사람 · 기능 ↔ 코드 위치 · 운영 증거: compared with what the service holds now.
+  const materials = project ? await authed('GET', `/projects/${encodeURIComponent(project.id)}/evidence`).catch(() => null) : null;
+  const evidenceItems = sheet.evidenceSection ? prepareEvidence(sheet.evidence, baseDir, files, materials?.items || []) : null;
+  const usageChanged = usage !== null && usage !== (materials?.usage_scope || '');
+  if (usageChanged) plan.push(`쓰는 사람: ${materials?.usage_scope || '(비어 있음)'} → ${usage}`);
+  const focusChanged = JSON.stringify(focus) !== JSON.stringify(materials?.focus_paths || []) && (focus.length > 0 || Boolean(materials?.focus_paths?.length));
+  if (focusChanged) plan.push(`기능 ↔ 코드 위치 ${focus.length}곳 (현황관리가 이 코드부터 읽음): ${focus.slice(0, 6).map((item) => `${item.path}${item.part ? ` › ${item.part}` : ''}`).join(', ')}${focus.length > 6 ? ` 외 ${focus.length - 6}곳` : ''}`);
+  let evidencePlan = null;
+  if (evidenceItems) {
+    const stored = materials?.items || [];
+    const wanted = evidenceItems.map((item) => {
+      if (!item.keep) return item;
+      const same = stored.find((row) => row.kind === item.kind && row.name === item.file);
+      if (!same) throw new UserError(`운영 증거 "${item.file}"을(를) 찾을 수 없습니다. 파일 경로를 적거나 그 줄을 지워 주세요.`);
+      return { kind: same.kind, name: same.name, taken: item.taken || same.taken, note: item.note || same.note, sha256: same.sha256, keep: true };
+    });
+    const key = (row) => [row.kind, row.name, row.taken || '', row.note || '', row.sha256].join('|');
+    const changed = wanted.map(key).join('\n') !== stored.map(key).join('\n');
+    if (changed) {
+      evidencePlan = wanted;
+      if (!wanted.length) plan.push('운영 증거 비우기 (올려 둔 실행 기록·화면 지움)');
+      else {
+        plan.push(`운영 증거 올리기 (관리자 검토용 비공개, 직원에게 안 보임):`);
+        for (const item of wanted) {
+          if (item.keep) { plan.push(`    ${item.kind === 'image' ? '실행 화면' : '실행 기록'} ${item.name}: 이미 올라가 있음`); continue; }
+          if (item.kind === 'image') plan.push(`    실행 화면 ${item.name}${item.taken ? ` · ${item.taken}` : ''}${item.note ? ` · ${item.note}` : ''} (화면 속 개인정보는 자동으로 가려지지 않으니 가린 캐처인지 확인)`);
+          else {
+            const sample = item.content.split('\n').filter((line) => line.trim()).slice(-2).map((line) => `      | ${line.slice(0, 160)}`).join('\n');
+            plan.push(`    실행 기록 ${item.name}${item.taken ? ` · ${item.taken}` : ''}: ${item.cut ? '최근 ' : ''}${item.lines}줄 ${item.content.length.toLocaleString('en-US')}자${Object.keys(item.kinds).length ? ` · 가림: ${kindsText(item.kinds)}` : ' · 가릴 것 없음'}\n      가린 결과 끝부분:\n${sample}`);
+          }
+        }
       }
     }
   }
@@ -863,7 +1079,7 @@ async function opApply(options) {
     return `${title}: 문서와 현황관리 내용이 이미 같습니다. 바꿀 것이 없습니다.${notListed.length ? `\n참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다. 빼려면 웹에서 하세요.` : ''}`;
   }
   if (notListed.length) plan.push(`참고: 문서에 없는 참여자(${notListed.map((row) => row.name).join(', ')})는 그대로 둡니다 (빼기는 웹에서).`);
-  await confirm(`${basename(sheetPath)} 기준으로 현황관리에 반영합니다.\n- ${plan.join('\n- ')}\n첨부는 전 직원이 볼 수 있습니다.${pack ? ' 제출 코드 묶음은 관리자 검토용으로만 쓰이고 직원에게 보이지 않습니다.' : ''}`, options);
+  await confirm(`${basename(sheetPath)} 기준으로 현황관리에 반영합니다.\n- ${plan.join('\n- ')}\n첨부는 전 직원이 볼 수 있습니다.${pack || evidencePlan?.length ? ' 제출 코드 묶음과 운영 증거는 관리자 검토용으로만 쓰이고 직원에게 보이지 않습니다.' : ''}`, options);
 
   // Apply, step by step: a failure reports what is already applied (re-running applies only the rest).
   const done = [];
@@ -926,10 +1142,29 @@ async function opApply(options) {
     }));
   }
   for (const upload of uploads) await step(`첨부 ${basename(upload.file)}`, () => uploadFile(project, upload.file, upload.existing));
-  if (pack) await step('제출 코드 묶음', () => uploadPack(project.id, pack));
+  if (pack) await step('제출 코드 묶음', () => uploadPack(project.id, pack, { code: pack.code, add: pack.add }));
+  if (usageChanged) await step('쓰는 사람', () => authed('PUT', `/projects/${encodeURIComponent(project.id)}/usage-scope`, { body: { text: usage } }));
+  if (focusChanged) await step('기능 ↔ 코드 위치', () => authed('PUT', `/projects/${encodeURIComponent(project.id)}/focus-paths`, { body: { paths: focus } }));
+  if (evidencePlan) {
+    await step('운영 증거', async () => {
+      const storedShas = new Set((materials?.items || []).filter((row) => row.kind === 'image').map((row) => row.sha256));
+      for (const item of evidencePlan) {
+        if (item.kind !== 'image' || item.keep || storedShas.has(item.sha256)) continue;
+        const sent = await authed('PUT', `/projects/${encodeURIComponent(project.id)}/evidence-image`, { raw: item.bytes, contentType: item.type });
+        if (sent?.sha256 !== item.sha256) throw new UserError(`${item.name}: 올린 화면이 확인되지 않았습니다. 다시 실행해 주세요.`);
+      }
+      // Logs already on the service are kept by their hash (their text is not sent again).
+      const items = evidencePlan.map((item) => (item.kind === 'image'
+        ? { kind: 'image', name: item.name, taken: item.taken || '', note: item.note || '', sha256: item.sha256 }
+        : item.keep ? { kind: 'log', name: item.name, taken: item.taken || '', note: item.note || '', sha256: item.sha256 }
+          : { kind: 'log', name: item.name, taken: item.taken || '', note: item.note || '', content: item.content }));
+      await authed('PUT', `/projects/${encodeURIComponent(project.id)}/evidence`, { body: { items, generator: `kch-ai ${VERSION}` } });
+    });
+  }
   const repoUrl = project.repo?.url || (project.repo ? `https://github.com/${project.repo.owner}/${project.repo.repo}` : repo?.url || null);
-  const notice = pack ? `제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, 직원에게 안 보임). GitHub 없이도 현황관리가 이 코드를 읽습니다.${repoUrl ? '\n참고: 저장소를 읽기 연결하면(kch-ai repo) 그 뒤로는 GitHub 코드를 우선 씁니다.' : ''}` : [await repoNotice(project, repoUrl), packHint].filter(Boolean).join('\n');
-  return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}${notice ? `\n${notice}` : ''}`;
+  const notice = pack ? `제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, 직원에게 안 보임). ${pack.code ? 'GitHub 없이도 현황관리가 이 코드를 읽습니다.' : '저장소 밖 코드를 저장소와 함께 읽습니다.'}${repoUrl && pack.code ? '\n참고: 저장소를 읽기 연결하면(kch-ai repo) 그 뒤로는 GitHub 코드를 우선 씁니다.' : ''}` : [await repoNotice(project, repoUrl), packHint].filter(Boolean).join('\n');
+  const status = await statusLines(project.id);
+  return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}${notice ? `\n${notice}` : ''}${status ? `\n${status}` : ''}`;
 }
 
 /* ---------------- repository access (현황관리가 코드를 읽을 수 있나) ---------------- */
@@ -1173,11 +1408,12 @@ async function opRepo(options) {
 const PACK_SKIP_DIRS = /(^|\/)(node_modules|dist|build|out|coverage|vendor|\.git|\.next|\.nuxt|\.cache|__pycache__|\.venv|venv|target|bin|obj|\.idea|\.vscode)(\/|$)/i;
 const PACK_SKIP_FILES = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|poetry\.lock|Cargo\.lock|composer\.lock)$/i;
 const PACK_CODE = /\.(ts|tsx|js|jsx|mjs|cjs|gs|py|cs|java|kt|go|rb|php|vue|svelte|sql|ps1|vba|bas|html|css)$/i;
-const PACK_MAX_FILES = 20;
-const PACK_FILE_CHARS = 14_000;
+// 1.7.0: the server's limits (80 files, 20,000 characters each, 200,000 in all, parts of 80,000), with a margin.
+const PACK_MAX_FILES = 80;
+const PACK_FILE_CHARS = 20_000;
 const PACK_HTML_CHARS = 6_000;
-const PACK_TOTAL_CHARS = 140_000;
-const PACK_PART_CHARS = 70_000;
+const PACK_TOTAL_CHARS = 195_000;
+const PACK_PART_CHARS = 76_000;
 const PACK_STATE_FILE = () => join(configDir(), 'code-packs.json');
 const PACK_KEY_LINE = /UrlFetchApp|\bfetch\(|axios|XMLHttpRequest|https?:\/\/|chrome\.(?:tabs|scripting|downloads|runtime|storage)|openai|gemini|anthropic|claude|gpt-|\broles?\b|권한|\badmin|관리자|approv|승인|\bstatus\b|상태|\bqueue|\bworker|dispatch|\bassign|LockService|\block\b|\bretry|\bresume|GmailApp|MailApp|SpreadsheetApp|CalendarApp|DriveApp|DocumentApp|HtmlService|\bdoGet\b|\bdoPost\b|Trigger/gi;
 
@@ -1287,14 +1523,62 @@ function unsafePackRoot(root) {
   return ['Downloads', 'Desktop', 'Documents', 'OneDrive', '다운로드', '바탕 화면', '문서'].some((name) => here === resolve(home, name) || here === resolve(home, 'OneDrive', name));
 }
 
-/** Builds the private code pack from a folder: up to 20 files, 140,000 characters, in parts of 70,000. */
-function buildPack(root) {
-  if (unsafePackRoot(root)) throw new UserError(`${root} 는 프로젝트 폴더가 아니라서 코드를 묶지 않았습니다. 프로젝트 코드가 있는 폴더에서 실행하세요.`);
-  const all = projectFiles(root);
-  if (all.length > 2000) throw new UserError(`${root} 에 파일이 ${all.length}개로 너무 많아 코드를 묶지 않았습니다. 프로젝트 코드만 있는 폴더에서 실행하세요.`);
+/** A folder with at least one code file (and not a personal folder such as Downloads or Desktop). */
+function folderHasCode(dir) {
+  if (!dir || unsafePackRoot(dir)) return false;
+  try { return projectFiles(dir).some((path) => PACK_CODE.test(path) && !PACK_SKIP_DIRS.test(path)); } catch { return false; }
+}
+
+/** Lines from each named part of a long key file (same rule as the server's focusExcerpt). */
+function focusExcerpt(text, parts, cap) {
+  if (text.length <= cap) return { content: text, excerpted: false };
+  const lines = text.split('\n').map((line) => (line.length > 600 ? `${line.slice(0, 600)} …` : line));
+  const starts = parts.filter((part) => part.length >= 3).map((name) => lines.findIndex((line) => line.includes(name))).filter((index) => index >= 0);
+  if (!starts.length) return packExcerpt(text, cap);
+  const keep = new Set();
+  let used = 0;
+  const headChars = Math.floor(cap * 0.12);
+  for (let i = 0; i < lines.length && used + lines[i].length + 1 <= headChars; i += 1) { keep.add(i); used += lines[i].length + 1; }
+  const share = Math.floor((cap - used) / starts.length);
+  for (const start of starts) {
+    let taken = 0;
+    for (let i = Math.max(0, start - 2); i < lines.length && taken + lines[i].length + 1 <= share; i += 1) if (!keep.has(i)) { keep.add(i); taken += lines[i].length + 1; }
+  }
+  const out = [];
+  let prev = -1;
+  for (const index of [...keep].sort((a, b) => a - b)) {
+    if (index !== prev + 1) out.push(`… (${index + 1}번째 줄)`);
+    out.push(lines[index]);
+    prev = index;
+  }
+  return { content: out.join('\n').slice(0, cap), excerpted: true };
+}
+
+/**
+ * Builds the private code pack: the code folder (root, may be null) plus folders outside the repository (extra),
+ * key files named in the 정리 문서 first (focus), up to 80 files and 195,000 characters, in parts.
+ */
+function buildPack(root, { focus = [], extra = [] } = {}) {
+  const sources = [];
+  for (const [index, dir] of [root, ...extra].entries()) {
+    if (!dir) continue;
+    if (unsafePackRoot(dir)) throw new UserError(`${dir} 는 프로젝트 폴더가 아니라서 코드를 묶지 않았습니다. 프로젝트 코드가 있는 폴더를 알려 주세요.`);
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) throw new UserError(`코드 폴더를 찾을 수 없습니다: ${dir}`);
+    const outside = index > 0 || !root;
+    sources.push({ dir, outside: index > 0, prefix: outside && index > 0 ? `${basename(dir)}/` : '' });
+  }
+  const all = [];
+  for (const source of sources) {
+    const listed = projectFiles(source.dir);
+    if (listed.length > 2000) throw new UserError(`${source.dir} 에 파일이 ${listed.length}개로 너무 많아 코드를 묶지 않았습니다. 프로젝트 코드만 있는 폴더를 알려 주세요.`);
+    for (const rel of listed) all.push({ path: `${source.prefix}${rel}`, rel, source });
+  }
+  const focusPaths = focus.map((item) => item.path);
+  const partsOf = (path) => focus.filter((item) => item.path === path && item.part).map((item) => item.part);
   const picked = all
-    .filter((path) => !PACK_SKIP_DIRS.test(path) && !PACK_SKIP_FILES.test(path) && !BINARY_FILE.test(path) && !(SECRET_FILE.test(path) && !EXAMPLE_FILE.test(path)) && !/^kch-ai-code/.test(basename(path)))
-    .map((path) => ({ path, s: packScore(path) }))
+    .filter(({ path, rel }) => !PACK_SKIP_DIRS.test(rel) && !PACK_SKIP_FILES.test(rel) && !BINARY_FILE.test(rel) && !(SECRET_FILE.test(rel) && !EXAMPLE_FILE.test(rel)) && !/^kch-ai-code/.test(basename(path)))
+    // Named key files first (기능 ↔ 코드 위치), then the usual ranking.
+    .map((item) => ({ ...item, s: focusPaths.includes(item.path) || focusPaths.includes(item.rel) ? 1000 : packScore(item.rel) }))
     .filter((item) => item.s > 0)
     .sort((a, b) => b.s - a.s || a.path.localeCompare(b.path))
     // Same score: alternate between folders (src/client, src/server, ...) so one big folder does not take every slot.
@@ -1305,8 +1589,8 @@ function buildPack(root) {
   const sections = [];
   const files = [];
   let left = PACK_TOTAL_CHARS;
-  for (const { path } of picked) {
-    const full = join(root, path);
+  for (const { path, rel, source } of picked) {
+    const full = join(source.dir, rel);
     let raw = '';
     try {
       const info = lstatSync(full);
@@ -1315,22 +1599,24 @@ function buildPack(root) {
     } catch { continue; }
     if (raw.includes('\u0000')) continue;
     // Single-file tools (the whole app inside <script>) are code: code budget, <style> blocks dropped (same rule as the site).
-    let source = raw.replace(/\r\n/g, '\n');
+    let text = raw.replace(/\r\n/g, '\n');
     let heavy = false;
     if (/\.html?$/i.test(path)) {
-      const scripts = [...source.matchAll(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].reduce((sum, match) => sum + match[1].trim().length, 0);
-      heavy = scripts >= 3000 || (source.length > 0 && scripts / source.length >= 0.3);
-      if (heavy) source = source.replace(/(<style\b[^>]*>)[\s\S]*?(<\/style>)/gi, '$1/* 스타일 생략 */$2');
+      const scripts = [...text.matchAll(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].reduce((sum, match) => sum + match[1].trim().length, 0);
+      heavy = scripts >= 3000 || (text.length > 0 && scripts / text.length >= 0.3);
+      if (heavy) text = text.replace(/(<style\b[^>]*>)[\s\S]*?(<\/style>)/gi, '$1/* 스타일 생략 */$2');
     }
     const cap = Math.min(/\.html?$/i.test(path) && !heavy ? PACK_HTML_CHARS : PACK_FILE_CHARS, left);
     if (cap <= 200) break;
-    const { content, excerpted } = packExcerpt(maskPack(source), cap);
+    const named = [...partsOf(path), ...partsOf(rel)];
+    const { content, excerpted } = named.length ? focusExcerpt(maskPack(text), named, cap) : packExcerpt(maskPack(text), cap);
     left -= content.length;
     const longest = Math.max(3, ...(content.match(/`{3,}/g) ?? []).map((run) => run.length));
     const fence = '`'.repeat(longest + 1);
     const ext = extname(path).slice(1).toLowerCase();
     files.push({ path, chars: content.length, excerpted, total: raw.length });
-    sections.push(`### 파일: ${path} · ${excerpted ? `전체 ${raw.length.toLocaleString('en-US')}자 중 앞부분과 핵심 줄` : `전체 ${raw.length.toLocaleString('en-US')}자`}\n${fence}${ext}\n${content}\n${fence}\n`);
+    const what = excerpted ? `전체 ${raw.length.toLocaleString('en-US')}자 중 앞부분과 ${named.length ? `${named.join('·')} 부분 (발췌)` : '핵심 줄'}` : `전체 ${raw.length.toLocaleString('en-US')}자`;
+    sections.push(`### 파일: ${path} · ${source.outside ? `저장소 밖(${basename(source.dir)}) · ` : ''}${what}\n${fence}${ext}\n${content}\n${fence}\n`);
   }
   const fingerprint = createHash('sha256').update(sections.join('\n')).digest('hex');
   const chunks = [];
@@ -1341,31 +1627,54 @@ function buildPack(root) {
   const at = new Date().toISOString();
   const parts = chunks.slice(0, 5).map((body, index, list) => ({
     name: `kch-ai-code-${index + 1}.md`,
-    content: [`# kch-ai 제출 코드 (${index + 1}/${list.length})`, `- 만든 도구: kch-ai ${VERSION}`, `- 만든 시각: ${at}`, `- 폴더: ${basename(root)}`, `- 담은 파일: ${files.length}개 (폴더 전체 ${all.length}개 중, 코드·설정 먼저)`, '', body].join('\n'),
+    content: [`# kch-ai 제출 코드 (${index + 1}/${list.length})`, `- 만든 도구: kch-ai ${VERSION}`, `- 만든 시각: ${at}`, `- 폴더: ${sources.map((source) => `${basename(source.dir)}${source.outside ? ' (저장소 밖)' : ''}`).join(', ')}`, `- 담은 파일: ${files.length}개 (폴더 전체 ${all.length}개 중, 핵심 파일·코드·설정 먼저)`, '', body].join('\n'),
   }));
   return { parts, files, total: all.length, fingerprint };
 }
 
 const packKey = (projectId) => `${serverUrl()}|${projectId}`;
-const lastPackFingerprint = (projectId) => readJsonFile(PACK_STATE_FILE(), {})[packKey(projectId)]?.fingerprint ?? null;
-function rememberPack(projectId, fingerprint) {
+const packStateOf = (projectId) => readJsonFile(PACK_STATE_FILE(), {})[packKey(projectId)] || {};
+const lastPackFingerprint = (projectId) => packStateOf(projectId).fingerprint ?? null;
+/** Also remembers the code folder (--code) and the folders outside the repository (--add) for the next apply. */
+function rememberPack(projectId, fingerprint, folders = {}) {
   const state = readJsonFile(PACK_STATE_FILE(), {});
-  state[packKey(projectId)] = { fingerprint, at: new Date().toISOString() };
+  const before = state[packKey(projectId)] || {};
+  state[packKey(projectId)] = { ...before, fingerprint, at: new Date().toISOString(), ...(folders.code !== undefined ? { code: folders.code } : {}), ...(folders.add !== undefined ? { add: folders.add } : {}) };
   writePrivate(PACK_STATE_FILE(), state);
+}
+
+/** 진행 상태 (1.7.0): whether the service has looked at the new material, and the operator's open requests. No step or grade. */
+async function statusLines(projectId) {
+  const status = await authed('GET', `/projects/${encodeURIComponent(projectId)}/review-status`).catch(() => null);
+  if (!status) return '';
+  const lines = [];
+  if (status.state === 'running') lines.push('현황관리가 새 자료를 읽고 있습니다.');
+  else if (status.state === 'waiting') lines.push('현황관리가 새 자료를 곧 읽습니다 (보통 30분 안).');
+  else lines.push('현황관리가 지금 자료를 모두 읽었습니다.');
+  if (status.images_waiting) lines.push('화면 캐처 일부는 내일 이어서 읽습니다.');
+  if (status.requests?.length) {
+    lines.push(`관리자 요청 ${status.requests.length}건 (자료를 올린 뒤 웹 프로젝트 화면에서 답해 주세요):`);
+    for (const request of status.requests) lines.push(`  - ${request.question}`);
+  }
+  return lines.join('\n');
 }
 const packFileList = (pack) => `${pack.files.slice(0, 10).map((file) => file.path).join(', ')}${pack.files.length > 10 ? ` 외 ${pack.files.length - 10}개` : ''}`;
 
-async function uploadPack(projectId, pack) {
+async function uploadPack(projectId, pack, folders = {}) {
   await authed('PUT', `/projects/${encodeURIComponent(projectId)}/code-pack`, { body: { parts: pack.parts, generator: `kch-ai ${VERSION}` } });
-  rememberPack(projectId, pack.fingerprint);
+  rememberPack(projectId, pack.fingerprint, folders);
 }
 
 /** kch-ai pack: send this folder's code privately so the judgment can read it without GitHub. */
 async function opPack(options) {
   const profile = await me();
   const project = await requireProject(options, profile);
-  const root = gitRoot(options.folder) || resolve(options.folder || process.cwd());
-  const pack = buildPack(root);
+  const root = options.code ? resolve(options.code) : gitRoot(options.folder) || resolve(options.folder || process.cwd());
+  const add = options.add ? String(options.add).split(/[;,]/).map((item) => item.trim()).filter(Boolean).map((item) => resolve(item)) : [];
+  // 기능 ↔ 코드 위치 from the 정리 문서 next to the code, when there is one.
+  const sheetFile = [join(root, SHEET_NAME), resolve(options.folder || process.cwd(), SHEET_NAME)].find((file) => existsSync(file));
+  const focus = sheetFile ? focusPathsOf(parseSheet(readFileSync(sheetFile, 'utf8')).notes) : [];
+  const pack = buildPack(root, { focus, extra: add });
   if (!pack.files.length) throw new UserError(`${root} 에서 담을 코드 파일을 찾지 못했습니다. 프로젝트 코드가 있는 폴더에서 실행하세요 (Apps Script는 .gs 파일을 이 폴더에 내려받은 뒤).`);
   const summary = [
     `${project.title}: 이 폴더의 코드로 제출 코드 묶음을 만들어 올립니다.`,
@@ -1375,7 +1684,7 @@ async function opPack(options) {
     '  GitHub로 코드를 읽을 수 있는 프로젝트는 GitHub를 먼저 씁니다.',
   ].join('\n');
   await confirm(summary, options);
-  await uploadPack(project.id, pack);
+  await uploadPack(project.id, pack, { code: root, add });
   return `${project.title}: 제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, ${pack.parts.length}개로 나눔). 현황관리가 이 코드를 읽습니다.`;
 }
 
@@ -1391,6 +1700,9 @@ const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
   repo                                  현황관리가 이 저장소 코드를 읽게 연결 (비공개 유지, GitHub 승인 화면 열림)
   repo --public                         저장소를 공개로 전환 (키·비밀번호 검사 후, gh 필요)
   pack                                  GitHub 없이: 이 폴더 코드를 관리자 검토용 비공개 묶음으로 올리기 (apply 때 자동)
+  apply --code "코드 폴더"            정리 문서와 코드가 다른 폴더일 때 코드 폴더 지정 (다음부터 기억)
+  apply --add "폴더"                    저장소 밖에 있는 코드도 비공개로 함께 (예: 따로 둔 서버 코드, 여러 개는 , 로)
+  운영 증거                              정리 문서 ## 운영 증거 에 적은 실행 화면·실행 기록을 가려서 비공개로 (apply 때)
 
   모든 등록·업데이트는 kch-ai-project.md 를 고친 뒤 apply 로 합니다 (진행 상태 하나만 바꿀 때도).
   undo                                  마지막 변경 되돌리기 (24시간 안)
@@ -1400,7 +1712,7 @@ const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
   --yes              확인 없이 실행 (AI가 사용자 확인을 받은 뒤 사용)
 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료`;
 
-const VALUE_FLAGS = new Set(['project', 'stage', 'sentence', 'before', 'progress', 'next', 'server', 'folder', 'file']);
+const VALUE_FLAGS = new Set(['project', 'stage', 'sentence', 'before', 'progress', 'next', 'server', 'folder', 'file', 'code', 'add']);
 function parseArgs(argv) {
   const options = { _: [] };
   for (let index = 0; index < argv.length; index += 1) {
