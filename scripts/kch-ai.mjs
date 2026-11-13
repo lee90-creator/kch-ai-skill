@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.7.0';
+const VERSION = '1.8.0';
 const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
 // The service moved (2026-10-12); a config saved with the old address follows it.
 const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
@@ -479,6 +479,8 @@ const SHEET_SECTIONS = [
   { key: 'people', match: /^\s*(함께|담당자|참여자)/, title: '함께 하는 사람' },
   { key: 'saving', match: /^\s*줄어든/, title: '줄어든 시간 (사람 손이 들던 시간이 얼마나 줄었나)' },
   { key: 'files', match: /^\s*첨부/, title: '첨부' },
+  // 1.8.0: where the project leaves its own run records. Only dates and counts are read and sent.
+  { key: 'usagelog', match: /^\s*사용\s*기록/, title: '사용 기록 (현황관리는 실행 기록의 날짜와 개수만 읽음)' },
   // 1.7.0: run screens and run logs the person picks. Private (관리자 검토용), never an attachment.
   { key: 'evidence', match: /^\s*운영\s*증거/, title: '운영 증거 (관리자 검토용 비공개, 직원에게 안 보임)' },
   { key: 'notes', match: /^\s*(참고|메모|상세)/, title: '참고 (현황관리 입력칸에는 들어가지 않고, 이 문서 첨부로만 공유)' },
@@ -508,11 +510,16 @@ function renderSheet(data) {
       );
     }
     else if (section.key === 'files') for (const file of data.files || []) lines.push(`- ${file}`);
+    else if (section.key === 'usagelog') {
+      const sources = data.usage_sources?.length ? data.usage_sources : [{ path: '', kind: '' }];
+      for (const source of sources) lines.push(`- 기록 위치: ${source.path ? `${source.path} · ${USAGE_KIND_LABEL[source.kind] || source.kindText || ''}` : ''}`);
+      lines.push(`- 한 번 사용으로 셀 기준: ${data.usage_rule || ''}`);
+    }
     else if (section.key === 'evidence') for (const item of data.evidence || []) lines.push(`- ${item.kind === 'image' ? '실행 화면' : '실행 기록'}: ${item.name} · ${item.taken || ''} · ${item.note || ''}  (이미 올라가 있음)`);
     else if (data[section.key]) lines.push(data[section.key]);
     lines.push('');
   }
-  lines.push('<!-- kch-ai 스킬이 이 문서를 기준으로 KCH AI 현황관리에 반영합니다. 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료. 역할: 기획 / 개발 / QA / 현업 담당 / 운영. 운영 방식: AI 없이 프로그램·로봇만 / 일부 단계만 AI / 매번 AI. 줄어든 시간: 1회에 사람 손이 드는 시간(예: 3시간, 1시간 30분, 10분), 횟수(월 4회, 주 2회, 매일), 누구 시간(나, 참여자 이름, 외 N명), 근거(직접 잼 / 추정). 쓰는 사람: 부서·인원·각자 계정인지 (예: 재무팀 5명이 각자 계정으로). 운영 증거: "- 실행 화면: 파일 · 날짜 · 무엇" / "- 실행 기록: 파일 · 날짜 · 무엇" (사용자가 고른 파일만, 비공개). 첨부 경로는 이 문서 기준. 비밀번호·키·개인정보 금지. -->');
+  lines.push('<!-- kch-ai 스킬이 이 문서를 기준으로 KCH AI 현황관리에 반영합니다. 진행 상태: 계획 중 / 개발 중 / QA 중 / 개발 완료. 역할: 기획 / 개발 / QA / 현업 담당 / 운영. 운영 방식: AI 없이 프로그램·로봇만 / 일부 단계만 AI / 매번 AI. 줄어든 시간: 1회에 사람 손이 드는 시간(예: 3시간, 1시간 30분, 10분), 횟수(월 4회, 주 2회, 매일), 누구 시간(나, 참여자 이름, 외 N명), 근거(직접 잼 / 추정). 쓰는 사람: 부서·인원·각자 계정인지 (예: 재무팀 5명이 각자 계정으로). 사용 기록: "- 기록 위치: 경로 · 실행 로그 / 처리 결과물 폴더 / DB 표(CSV로 내보낸 파일) / 예약 실행 기록", "- 한 번 사용으로 셀 기준: 로그의 \"처리 완료\" 줄 1개" (날짜와 개수만 보냄, 없으면 없음). 운영 증거: "- 실행 화면: 파일 · 날짜 · 무엇" / "- 실행 기록: 파일 · 날짜 · 무엇" (사용자가 고른 파일만, 비공개). 첨부 경로는 이 문서 기준. 비밀번호·키·개인정보 금지. -->');
   return `${lines.join('\n')}\n`;
 }
 
@@ -566,6 +573,20 @@ function parseSheet(text) {
   }
   // Without the heading (sheets from 1.6 and earlier) the stored 운영 증거 is left as it is.
   sheet.evidenceSection = Boolean(buffer.evidence);
+  // 사용 기록 (1.8.0): "- 기록 위치: 경로 · 종류" (one or more), "- 한 번 사용으로 셀 기준: ...".
+  sheet.usageSection = Boolean(buffer.usagelog);
+  sheet.usageSources = [];
+  sheet.usageRule = '';
+  for (const line of buffer.usagelog || []) {
+    const match = /^[-*]\s*(기록\s*위치|(?:한\s*번\s*사용으로\s*)?셀\s*기준)\s*[:：]\s*(.*)$/.exec(line.trim());
+    if (!match) continue;
+    const value = match[2].trim();
+    if (/기준/.test(match[1])) { sheet.usageRule = value.replace(/^\(?없음\)?$/, '').slice(0, 200); continue; }
+    if (!value || /^\(?없음\)?$|^확인\s*못\s*함$/.test(value)) continue;
+    const parts = value.split(/\s+·\s+/);
+    const path = parts[0].replace(/^`|`$/g, '').trim();
+    sheet.usageSources.push({ path, kindText: parts.slice(1).join(' ') || path });
+  }
   if (buffer.saving) {
     const raw = {};
     for (const line of buffer.saving) {
@@ -807,6 +828,192 @@ function prepareEvidence(entries, baseDir, attachmentFiles, storedLogs = []) {
   return items;
 }
 
+/* ---------------- 사용 기록 · 실제 사용 (1.8.0) ---------------- */
+// The project's own run records are READ, never run (running it would itself add a test run).
+// Only per-day counts, the record kind, the counting rule, file count and file fingerprints are sent.
+
+const USAGE_KIND_LABEL = { log: '실행 로그', output: '처리 결과물 폴더', db: 'DB 표', schedule: '예약 실행 기록' };
+function usageKindOf(text) {
+  const value = String(text || '');
+  if (/예약|스케줄|트리거|schedule|cron/i.test(value)) return 'schedule';
+  if (/결과|output|내보낸\s*파일\s*폴더/i.test(value)) return 'output';
+  if (/\bdb\b|DB|표|테이블|table/i.test(value)) return 'db';
+  if (/로그|log|기록/i.test(value)) return 'log';
+  throw new UserError(`기록 위치의 종류 "${value}"를 알 수 없습니다. 실행 로그 / 처리 결과물 폴더 / DB 표 / 예약 실행 기록 중 하나로 적어 주세요.`);
+}
+const USAGE_TEST = /(^|[^a-z])(test(?:ing|s)?|demo|sample|dry[-_ ]?run|mock|sandbox|staging)([^a-z]|$)|테스트|시연|샘플|모의/i;
+const USAGE_TEXT_EXT = /\.(log|txt|csv|tsv|json|jsonl|out|md)$/i;
+const USAGE_DB_FILE = /\.(db|sqlite3?|mdb|accdb)$/i;
+const KST_OFFSET_MS = 9 * 3600_000;
+const kstDayOf = (date) => new Date(date.getTime() + KST_OFFSET_MS).toISOString().slice(0, 10);
+const addDays = (day, n) => new Date(Date.parse(`${day}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+const validYmd = (y, m, d) => Number(m) >= 1 && Number(m) <= 12 && Number(d) >= 1 && Number(d) <= 31 && Number(y) >= 2000 && Number(y) <= 2099;
+const ymd = (y, m, d) => `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+
+/** The Korean calendar day a record line is from, or null when it carries no readable date. */
+function recordDay(line) {
+  // ISO time with a zone (Z or +09:00): converted to the Korean day.
+  let m = /(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?\s?(Z|[+-]\d{2}:?\d{2})(?![\d:])/.exec(line);
+  if (m && validYmd(m[1], m[2], m[3])) {
+    const date = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00${m[6] === 'Z' ? 'Z' : m[6].replace(/^([+-]\d{2})(\d{2})$/, '$1:$2')}`);
+    if (!Number.isNaN(date.getTime())) return kstDayOf(date);
+  }
+  m = /(?<!\d)((?:19|20)\d{2})[-./](\d{1,2})[-./](\d{1,2})(?!\d)/.exec(line);
+  if (m && validYmd(m[1], m[2], m[3])) return ymd(m[1], m[2], m[3]);
+  m = /((?:19|20)\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일/.exec(line);
+  if (m && validYmd(m[1], m[2], m[3])) return ymd(m[1], m[2], m[3]);
+  m = /(?<!\d)((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?:(?:[01]\d|2[0-3])[0-5]\d(?:[0-5]\d)?)?(?!\d)/.exec(line);
+  if (m) return ymd(m[1], m[2], m[3]);
+  return null;
+}
+
+/** Files of one record location: a file, a folder (up to 3 levels), or a folder with * in the last part. */
+function usageFiles(target, kind) {
+  const own = resolve(configDir());
+  const keep = (file) => !file.startsWith(own) && !/kch-ai/i.test(basename(file)) && !basename(file).startsWith('.');
+  let dir = target;
+  let pattern = null;
+  if (basename(target).includes('*')) {
+    dir = dirname(target);
+    pattern = new RegExp(`^${basename(target).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`, 'i');
+  }
+  if (!existsSync(dir)) return [];
+  if (!pattern && statSync(dir).isFile()) {
+    if (kind === 'db' && USAGE_DB_FILE.test(dir)) throw new UserError(`${basename(dir)}: DB 파일은 직접 읽지 않습니다. 사용 기록 표를 CSV로 내보낸 파일 경로를 적어 주세요.`);
+    return keep(dir) ? [dir] : [];
+  }
+  const found = [];
+  const walk = (folder, depth) => {
+    if (depth > 3 || found.length >= 2000) return;
+    let entries = [];
+    try { entries = readdirSync(folder, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = join(folder, entry.name);
+      if (entry.isSymbolicLink() || entry.name.startsWith('.')) continue;
+      if (entry.isDirectory()) { if (!pattern && !PACK_SKIP_DIRS.test(`${entry.name}/`)) walk(full, depth + 1); continue; }
+      if (!entry.isFile() || !keep(full)) continue;
+      if (pattern && !pattern.test(entry.name)) continue;
+      if (kind !== 'output' && !USAGE_TEXT_EXT.test(entry.name)) continue;
+      found.push(full);
+    }
+  };
+  walk(dir, 0);
+  return found.sort();
+}
+
+/**
+ * Counts uses per Korean day from the listed record locations (last 90 days, from the registration day).
+ * Lines need the rule's quoted text (로그의 "처리 완료" 줄 1개); result files count one each (quoted text, if any, filters names).
+ * Not counted: test/demo lines, re-runs of the same input (a repeated input fingerprint, or the same line twice),
+ * lines without a readable date, and lines the skill itself wrote.
+ */
+function collectUsage(sources, rule, baseDir, { registeredOn, today = kstDayOf(new Date()) } = {}) {
+  const markers = [...String(rule || '').matchAll(/["“”'‘’]([^"“”'‘’]{1,80})["“”'‘’]/g)].map((match) => match[1].trim().toLowerCase()).filter(Boolean);
+  const from = addDays(today, -89);
+  const start = registeredOn && registeredOn > from ? registeredOn : from;
+  const out = { kinds: new Set(), files: 0, fingerprints: new Set(), days: {}, test: 0, rerun: 0, undated: 0, before: 0, dated: false, problems: [] };
+  const seenLines = new Set();
+  const seenInputs = new Set();
+  const count = (day) => {
+    if (day > today) return;
+    if (day < start) { out.before += 1; return; }
+    out.days[day] = (out.days[day] || 0) + 1;
+  };
+  sources = sources.map((source) => ({ ...source, kind: source.kind || usageKindOf(source.kindText) }));
+  for (const source of sources) {
+    out.kinds.add(source.kind);
+    if (source.kind !== 'output' && !markers.length) {
+      throw new UserError('한 번 사용으로 셀 기준에, 기록에서 찾을 글자를 따옴표로 적어 주세요. 예: 로그의 "처리 완료" 줄 1개');
+    }
+    const files = usageFiles(resolve(baseDir, source.path), source.kind);
+    if (!files.length) { out.problems.push(`${source.path}: 기록 파일을 찾지 못함`); continue; }
+    for (const file of files) {
+      let bytes;
+      try {
+        if (statSync(file).size > 50_000_000) { out.problems.push(`${basename(file)}: 50MB가 넘어 건너뜀`); continue; }
+        bytes = readFileSync(file);
+      } catch { out.problems.push(`${basename(file)}: 읽지 못함`); continue; }
+      out.files += 1;
+      const sha = createHash('sha256').update(bytes).digest('hex');
+      out.fingerprints.add(sha);
+      if (source.kind === 'output') {
+        const name = relative(resolve(baseDir, source.path).replace(/[\\/][^\\/]*\*[^\\/]*$/, ''), file).split('\\').join('/');
+        if (markers.length && !markers.some((marker) => name.toLowerCase().includes(marker))) { out.files -= 1; out.fingerprints.delete(sha); continue; }
+        const day = recordDay(basename(file));
+        if (!day) { out.undated += 1; continue; }
+        out.dated = true;
+        if (USAGE_TEST.test(name)) { out.test += 1; continue; }
+        if (seenInputs.has(sha)) { out.rerun += 1; continue; }
+        seenInputs.add(sha);
+        count(day);
+        continue;
+      }
+      if (bytes.includes(0)) { out.problems.push(`${basename(file)}: 글자 파일이 아님`); continue; }
+      for (const raw of bytes.toString('utf8').split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line || !markers.some((marker) => line.toLowerCase().includes(marker))) continue;
+        if (/kch-ai/i.test(line)) continue;
+        const day = recordDay(line);
+        if (!day) { out.undated += 1; continue; }
+        out.dated = true;
+        if (USAGE_TEST.test(line)) { out.test += 1; continue; }
+        if (/(?<![\d:])\d{1,2}:\d{2}(?::\d{2})?(?![\d:])/.test(line) && !/\w=\d{1,2}:\d{2}/.test(line)) {
+          if (seenLines.has(line)) { out.rerun += 1; continue; }
+          seenLines.add(line);
+        }
+        const input = /(?:input|입력|in_file|infile|source|src|file_sha|sha256|hash)\s*[=:]\s*([0-9a-f]{40,64})(?![0-9a-f])/i.exec(line);
+        if (input) {
+          const key = input[1].toLowerCase();
+          if (seenInputs.has(key)) { out.rerun += 1; continue; }
+          seenInputs.add(key);
+        }
+        count(day);
+      }
+    }
+  }
+  const kinds = [...out.kinds];
+  const counted = out.files > 0 && out.dated;
+  const days = Object.fromEntries(Object.entries(out.days).sort(([a], [b]) => a.localeCompare(b)));
+  const recent = Object.entries(days).filter(([day]) => day >= addDays(today, -29)).reduce((sum, [, n]) => sum + n, 0);
+  const used = Object.keys(days).filter((day) => days[day] > 0);
+  return {
+    body: {
+      status: counted ? 'counted' : 'unverified',
+      source_kind: !kinds.length ? 'none' : kinds.length > 1 ? 'mixed' : kinds[0],
+      count_rule: String(rule || '').slice(0, 200),
+      files_read: out.files,
+      fingerprints: [...out.fingerprints].sort().slice(0, 200),
+      days: counted ? days : {},
+      excluded: { test: out.test, rerun: out.rerun, undated: out.undated },
+      collected_at: new Date().toISOString(),
+      generator: `kch-ai ${VERSION}`,
+    },
+    recent,
+    total: Object.values(days).reduce((sum, n) => sum + n, 0),
+    last: used.length ? used[used.length - 1] : null,
+    before: out.before,
+    problems: out.problems,
+    reason: counted ? '' : !sources.length ? '기록 위치가 없음' : out.files === 0 ? (out.problems[0] || '기록 파일을 찾지 못함') : '날짜가 있는 사용 기록을 찾지 못함',
+  };
+}
+
+const usageDay = (day) => (day ? `${day.slice(5, 7)}.${day.slice(8, 10)}` : '');
+/** One plan line: what will be sent (dates and counts only). */
+function usagePlanLine(result) {
+  if (result.body.status === 'unverified') return `사용 기록: 확인 못 함 (${result.reason}) · 현황관리에 "확인 못 함"으로 보냅니다`;
+  const { test, rerun, undated } = result.body.excluded;
+  const left = [test ? `테스트·시연 ${test}` : '', rerun ? `재실행 ${rerun}` : '', undated ? `날짜 없음 ${undated}` : '', result.before ? `등록일 이전·오래된 ${result.before}` : ''].filter(Boolean).join(', ');
+  return `사용 기록: 최근 30일 ${result.recent}회 · 마지막 ${result.last ? usageDay(result.last) : '최근 90일 없음'} (90일 ${result.total}회, 읽은 파일 ${result.body.files_read}개${left ? ` · 뺀 것: ${left}` : ''}) · 현황관리는 날짜와 개수만 받습니다${result.problems.length ? `\n    참고: ${result.problems.slice(0, 3).join(' / ')}` : ''}`;
+}
+/** Same as the newest collection sent today? (then nothing is sent again) */
+const usageDigest = (body) => createHash('sha256').update(`${body.status}|${JSON.stringify(body.days)}|${JSON.stringify(body.fingerprints)}`).digest('hex');
+const sameUsage = (latest, body, today) => Boolean(latest) && latest.received_on === today && latest.digest === usageDigest(body);
+const usageResultText = (usage) => {
+  if (!usage || usage.state === 'none' || usage.state === 'unverified') return `실제 사용: 확인 못 함${usage?.collected_on ? ` (kch-ai 수집 ${usage.collected_on})` : ''}`;
+  if (usage.state === 'stale') return `실제 사용: 사용 기록 오래됨 (kch-ai 수집 ${usage.collected_on})`;
+  return `실제 사용: 최근 30일 ${usage.count_30 ?? 0}회 · 마지막 ${usage.last_used ? usageDay(usage.last_used) : '최근 90일 없음'} (kch-ai 수집 ${usage.collected_on})`;
+};
+
 async function staffOf(projectId) {
   const rows = (await authed('GET', `/projects/${encodeURIComponent(projectId)}/staff`)).staff || [];
   return rows.filter((row) => row.active !== false);
@@ -883,7 +1090,11 @@ async function opSheet(options) {
   const timeSaving = (await authed('GET', `/projects/${encodeURIComponent(project.id)}/time-saving`).catch(() => ({ time_saving: null }))).time_saving;
   const saving = timeSaving?.saving ? { ...timeSaving.saving, people: timeSaving.saving.people.map((person) => (person.name === profile.name ? { ...person, name: '나' } : person)) } : null;
   const materials = await authed('GET', `/projects/${encodeURIComponent(project.id)}/evidence`).catch(() => null);
+  const usageNow = await authed('GET', `/projects/${encodeURIComponent(project.id)}/usage`).catch(() => null);
+  const usageSaved = packStateOf(project.id);
   return renderSheet({
+    usage_sources: usageSaved.usage_sources || [],
+    usage_rule: usageSaved.usage_rule || usageNow?.latest?.count_rule || '',
     usage: materials?.usage_scope || '',
     evidence: materials?.items || [],
     title: project.title,
@@ -1073,6 +1284,22 @@ async function opApply(options) {
       }
     }
   }
+  // 사용 기록 (1.8.0): read the run records (never run the program) and send dates and counts only.
+  let usageResult = null;
+  if (sheet.usageSection) {
+    const usageNow = project ? await authed('GET', `/projects/${encodeURIComponent(project.id)}/usage`).catch(() => null) : null;
+    const today = kstDayOf(new Date());
+    let collected = null;
+    // A broken 사용 기록 line must not stop the rest of apply: it is reported and nothing is sent for it.
+    try { collected = collectUsage(sheet.usageSources, sheet.usageRule, baseDir, { registeredOn: usageNow?.registered_on || today, today }); }
+    catch (error) { if (!(error instanceof UserError)) throw error; plan.push(`참고: 사용 기록은 보내지 않았습니다. ${error.message}`); }
+    if (collected && !sameUsage(usageNow?.latest, collected.body, today)) {
+      usageResult = collected;
+      plan.push(usagePlanLine(collected));
+    }
+  } else if (stage.value === '시범운영' || stage.value === '실운영') {
+    plan.push('참고: ## 사용 기록 칸이 없어 실제 사용은 "확인 못 함"으로 남습니다 (sheet 로 칸을 받아 기록 위치를 적으면 채워집니다).');
+  }
   if (kept.length) plan.push(`참고: ${kept.join(', ')} 은(는) 이미 올라가 있어 그대로 둡니다.`);
   if (merged.length) plan.push(`참고: ${merged.join(', ')} 이(가) 문서에 여러 줄이라 한 줄로 합쳤습니다 (역할도 합침).`);
   if (!plan.filter((line) => !line.startsWith('참고')).length) {
@@ -1161,10 +1388,18 @@ async function opApply(options) {
       await authed('PUT', `/projects/${encodeURIComponent(project.id)}/evidence`, { body: { items, generator: `kch-ai ${VERSION}` } });
     });
   }
+  let usageLine = '';
+  if (usageResult) {
+    await step('사용 기록', async () => {
+      const sent = await authed('PUT', `/projects/${encodeURIComponent(project.id)}/usage`, { body: usageResult.body });
+      usageLine = usageResultText(sent?.usage);
+    });
+    rememberUsageSources(project.id, sheet.usageSources, sheet.usageRule);
+  }
   const repoUrl = project.repo?.url || (project.repo ? `https://github.com/${project.repo.owner}/${project.repo.repo}` : repo?.url || null);
   const notice = pack ? `제출 코드 묶음을 올렸습니다 (파일 ${pack.files.length}개, 직원에게 안 보임). ${pack.code ? 'GitHub 없이도 현황관리가 이 코드를 읽습니다.' : '저장소 밖 코드를 저장소와 함께 읽습니다.'}${repoUrl && pack.code ? '\n참고: 저장소를 읽기 연결하면(kch-ai repo) 그 뒤로는 GitHub 코드를 우선 씁니다.' : ''}` : [await repoNotice(project, repoUrl), packHint].filter(Boolean).join('\n');
   const status = await statusLines(project.id);
-  return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}${notice ? `\n${notice}` : ''}${status ? `\n${status}` : ''}`;
+  return `${title}: ${basename(sheetPath)} 기준으로 반영했습니다 (${plan.filter((line) => !line.startsWith('참고') && !line.startsWith('  ')).length}건).\n${project.url || `${serverUrl()}/projects/${encodeURIComponent(project.id)}`}${usageLine ? `\n${usageLine}` : ''}${notice ? `\n${notice}` : ''}${status ? `\n${status}` : ''}`;
 }
 
 /* ---------------- repository access (현황관리가 코드를 읽을 수 있나) ---------------- */
@@ -1665,6 +1900,34 @@ async function uploadPack(projectId, pack, folders = {}) {
   rememberPack(projectId, pack.fingerprint, folders);
 }
 
+/** Where this PC reads the project's run records (the sheet shows them again on `sheet`). */
+function rememberUsageSources(projectId, sources, rule) {
+  const state = readJsonFile(PACK_STATE_FILE(), {});
+  state[packKey(projectId)] = { ...(state[packKey(projectId)] || {}), usage_sources: sources, usage_rule: rule };
+  writePrivate(PACK_STATE_FILE(), state);
+}
+
+/** kch-ai usage: count real uses from the run records named in the 정리 문서 and send dates and counts only. */
+async function opUsage(options) {
+  const sheetPath = resolve(options.folder || process.cwd(), options.file || SHEET_NAME);
+  if (!existsSync(sheetPath)) throw new UserError(`${sheetPath} 가 없습니다. 정리 문서의 ## 사용 기록 에 기록 위치를 적은 뒤 실행하세요.`);
+  const sheet = parseSheet(readFileSync(sheetPath, 'utf8'));
+  if (!sheet.usageSection) throw new UserError('정리 문서에 ## 사용 기록 칸이 없습니다. sheet 로 틀을 받아 기록 위치와 셀 기준을 적어 주세요.');
+  const baseDir = dirname(sheetPath);
+  const profile = await me();
+  let project = await findProject({ ...options, folder: baseDir }, profile);
+  if (!project) project = profile.projects.find((item) => item.title.trim().toLowerCase() === String(sheet.title || '').trim().toLowerCase()) || null;
+  if (!project) throw new UserError('이 정리 문서의 프로젝트가 아직 현황관리에 없습니다. 먼저 apply 로 등록해 주세요.');
+  const now = await authed('GET', `/projects/${encodeURIComponent(project.id)}/usage`);
+  const today = kstDayOf(new Date());
+  const result = collectUsage(sheet.usageSources, sheet.usageRule, baseDir, { registeredOn: now?.registered_on || today, today });
+  if (sameUsage(now?.latest, result.body, today)) return `${project.title}: 오늘 이미 같은 기록을 보냈습니다. 바꿀 것이 없습니다.\n${usageResultText(now.usage)}`;
+  await confirm(`${project.title}: 실행 기록을 읽어 날짜와 개수만 보냅니다 (프로그램은 실행하지 않음, 내용은 안 보냄).\n- ${usagePlanLine(result)}`, options);
+  const sent = await authed('PUT', `/projects/${encodeURIComponent(project.id)}/usage`, { body: result.body });
+  rememberUsageSources(project.id, sheet.usageSources, sheet.usageRule);
+  return `${project.title}: ${usageResultText(sent?.usage)}${sent?.dropped_days ? `\n참고: 등록일 이전이거나 앞으로의 날짜 ${sent.dropped_days}일은 현황관리가 뺍습니다.` : ''}`;
+}
+
 /** kch-ai pack: send this folder's code privately so the judgment can read it without GitHub. */
 async function opPack(options) {
   const profile = await me();
@@ -1702,6 +1965,7 @@ const HELP = `kch-ai ${VERSION} · KCH AI 현황관리 (문의: ${CONTACT})
   pack                                  GitHub 없이: 이 폴더 코드를 관리자 검토용 비공개 묶음으로 올리기 (apply 때 자동)
   apply --code "코드 폴더"            정리 문서와 코드가 다른 폴더일 때 코드 폴더 지정 (다음부터 기억)
   apply --add "폴더"                    저장소 밖에 있는 코드도 비공개로 함께 (예: 따로 둔 서버 코드, 여러 개는 , 로)
+  usage                                 실제 사용: ## 사용 기록 의 실행 기록을 읽어 날짜·개수만 보내기 (apply 때 자동, 프로그램 실행 안 함)
   운영 증거                              정리 문서 ## 운영 증거 에 적은 실행 화면·실행 기록을 가려서 비공개로 (apply 때)
 
   모든 등록·업데이트는 kch-ai-project.md 를 고친 뒤 apply 로 합니다 (진행 상태 하나만 바꿀 때도).
@@ -1734,7 +1998,7 @@ function parseArgs(argv) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const aliases = { 저장소: 'repo', 코드: 'pack', 정리: 'sheet', 반영: 'apply', sentence: 'profile', status: 'profile', setup: 'login', ls: 'list', 등록: 'new', 업데이트: 'profile', 보기: 'show', 첨부: 'attach', 되돌리기: 'undo' };
+  const aliases = { 사용: 'usage', 저장소: 'repo', 코드: 'pack', 정리: 'sheet', 반영: 'apply', sentence: 'profile', status: 'profile', setup: 'login', ls: 'list', 등록: 'new', 업데이트: 'profile', 보기: 'show', 첨부: 'attach', 되돌리기: 'undo' };
   const raw = options._[0] || 'help';
   const command = aliases[raw] || raw;
   const rest = options._.slice(1);
@@ -1786,6 +2050,8 @@ async function main() {
       return console.log(await opRepo(options));
     case 'pack':
       return console.log(await opPack(options));
+    case 'usage':
+      return console.log(await opUsage({ ...options, file: rest[0] || options.file }));
     default:
       throw new UserError(`알 수 없는 명령입니다: ${raw}\n\n${HELP}`);
   }
