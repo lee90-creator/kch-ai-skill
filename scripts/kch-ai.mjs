@@ -11,7 +11,7 @@ import { homedir, hostname, platform, userInfo } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
-const VERSION = '1.8.0';
+const VERSION = '1.9.0';
 const DEFAULT_SERVER = 'https://ai.kchglobal.co.kr';
 // The service moved (2026-10-12); a config saved with the old address follows it.
 const MOVED_SERVERS = new Set(['https://kch-ai-status.kch-lee90.workers.dev']);
@@ -847,6 +847,28 @@ const USAGE_DB_FILE = /\.(db|sqlite3?|mdb|accdb)$/i;
 const KST_OFFSET_MS = 9 * 3600_000;
 const kstDayOf = (date) => new Date(date.getTime() + KST_OFFSET_MS).toISOString().slice(0, 10);
 const addDays = (day, n) => new Date(Date.parse(`${day}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+/** 경영 평가 ⑤ looks at every month since this day; the server sends the same start as window_from. */
+const USAGE_SINCE = '2026-09-01';
+/** First day counted: USAGE_SINCE or 90 days back, whichever is older (never more than 400 days). */
+function usageWindowFrom(today) {
+  const recent = addDays(today, -89);
+  const longest = addDays(today, -399);
+  const start = USAGE_SINCE < recent ? USAGE_SINCE : recent;
+  return start < longest ? longest : start;
+}
+/** "2026-09" .. the month of `today`, with that month's count. */
+function usageMonths(days, from, today) {
+  const out = [];
+  let [year, month] = from.slice(0, 7).split('-').map(Number);
+  for (let key = from.slice(0, 7); key <= today.slice(0, 7) && out.length < 48; ) {
+    out.push({ month: key, count: Object.entries(days).filter(([day]) => day.startsWith(key)).reduce((sum, [, n]) => sum + n, 0) });
+    month += 1; if (month > 12) { month = 1; year += 1; }
+    key = `${year}-${String(month).padStart(2, '0')}`;
+  }
+  return out;
+}
+const monthName = (month) => `${Number(month.slice(5, 7))}월`;
+const monthsLine = (months) => months.map((item, i) => `${monthName(item.month)} ${item.count}회${i === months.length - 1 ? '(진행 중)' : ''}`).join(' · ');
 const validYmd = (y, m, d) => Number(m) >= 1 && Number(m) <= 12 && Number(d) >= 1 && Number(d) <= 31 && Number(y) >= 2000 && Number(y) <= 2099;
 const ymd = (y, m, d) => `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
 
@@ -902,15 +924,16 @@ function usageFiles(target, kind) {
 }
 
 /**
- * Counts uses per Korean day from the listed record locations (last 90 days, from the registration day).
+ * Counts uses per Korean day from the listed record locations, from `windowFrom` (USAGE_SINCE or 90 days back).
+ * Days before the project was registered count too (most projects ran before they were put on the site);
+ * the server marks them for an operator sample check.
  * Lines need the rule's quoted text (로그의 "처리 완료" 줄 1개); result files count one each (quoted text, if any, filters names).
  * Not counted: test/demo lines, re-runs of the same input (a repeated input fingerprint, or the same line twice),
  * lines without a readable date, and lines the skill itself wrote.
  */
-function collectUsage(sources, rule, baseDir, { registeredOn, today = kstDayOf(new Date()) } = {}) {
+function collectUsage(sources, rule, baseDir, { registeredOn, windowFrom, today = kstDayOf(new Date()) } = {}) {
   const markers = [...String(rule || '').matchAll(/["“”'‘’]([^"“”'‘’]{1,80})["“”'‘’]/g)].map((match) => match[1].trim().toLowerCase()).filter(Boolean);
-  const from = addDays(today, -89);
-  const start = registeredOn && registeredOn > from ? registeredOn : from;
+  const start = /^\d{4}-\d{2}-\d{2}$/.test(windowFrom || '') ? windowFrom : usageWindowFrom(today);
   const out = { kinds: new Set(), files: 0, fingerprints: new Set(), days: {}, test: 0, rerun: 0, undated: 0, before: 0, dated: false, problems: [] };
   const seenLines = new Set();
   const seenInputs = new Set();
@@ -976,6 +999,7 @@ function collectUsage(sources, rule, baseDir, { registeredOn, today = kstDayOf(n
   const days = Object.fromEntries(Object.entries(out.days).sort(([a], [b]) => a.localeCompare(b)));
   const recent = Object.entries(days).filter(([day]) => day >= addDays(today, -29)).reduce((sum, [, n]) => sum + n, 0);
   const used = Object.keys(days).filter((day) => days[day] > 0);
+  const months = usageMonths(days, start < USAGE_SINCE ? USAGE_SINCE : start, today);
   return {
     body: {
       status: counted ? 'counted' : 'unverified',
@@ -992,6 +1016,8 @@ function collectUsage(sources, rule, baseDir, { registeredOn, today = kstDayOf(n
     total: Object.values(days).reduce((sum, n) => sum + n, 0),
     last: used.length ? used[used.length - 1] : null,
     before: out.before,
+    months,
+    beforeRegistration: registeredOn ? used.filter((day) => day < registeredOn).length : 0,
     problems: out.problems,
     reason: counted ? '' : !sources.length ? '기록 위치가 없음' : out.files === 0 ? (out.problems[0] || '기록 파일을 찾지 못함') : '날짜가 있는 사용 기록을 찾지 못함',
   };
@@ -1002,8 +1028,12 @@ const usageDay = (day) => (day ? `${day.slice(5, 7)}.${day.slice(8, 10)}` : '');
 function usagePlanLine(result) {
   if (result.body.status === 'unverified') return `사용 기록: 확인 못 함 (${result.reason}) · 현황관리에 "확인 못 함"으로 보냅니다`;
   const { test, rerun, undated } = result.body.excluded;
-  const left = [test ? `테스트·시연 ${test}` : '', rerun ? `재실행 ${rerun}` : '', undated ? `날짜 없음 ${undated}` : '', result.before ? `등록일 이전·오래된 ${result.before}` : ''].filter(Boolean).join(', ');
-  return `사용 기록: 최근 30일 ${result.recent}회 · 마지막 ${result.last ? usageDay(result.last) : '최근 90일 없음'} (90일 ${result.total}회, 읽은 파일 ${result.body.files_read}개${left ? ` · 뺀 것: ${left}` : ''}) · 현황관리는 날짜와 개수만 받습니다${result.problems.length ? `\n    참고: ${result.problems.slice(0, 3).join(' / ')}` : ''}`;
+  const left = [test ? `테스트·시연 ${test}` : '', rerun ? `재실행 ${rerun}` : '', undated ? `날짜 없음 ${undated}` : '', result.before ? `오래된 ${result.before}` : ''].filter(Boolean).join(', ');
+  const notes = [
+    ...(result.beforeRegistration ? [`현황관리 등록 전 날짜 ${result.beforeRegistration}일 포함 (관리자가 기록 파일과 표본으로 맞춰 봅니다)`] : []),
+    ...result.problems.slice(0, 3),
+  ];
+  return `사용 기록: 최근 30일 ${result.recent}회 · 마지막 ${result.last ? usageDay(result.last) : '기록 없음'} (월별 ${monthsLine(result.months)}, 읽은 파일 ${result.body.files_read}개${left ? ` · 뺀 것: ${left}` : ''}) · 현황관리는 날짜와 개수만 받습니다${notes.length ? `\n    참고: ${notes.join(' / ')}` : ''}`;
 }
 /** Same as the newest collection sent today? (then nothing is sent again) */
 const usageDigest = (body) => createHash('sha256').update(`${body.status}|${JSON.stringify(body.days)}|${JSON.stringify(body.fingerprints)}`).digest('hex');
@@ -1011,7 +1041,9 @@ const sameUsage = (latest, body, today) => Boolean(latest) && latest.received_on
 const usageResultText = (usage) => {
   if (!usage || usage.state === 'none' || usage.state === 'unverified') return `실제 사용: 확인 못 함${usage?.collected_on ? ` (kch-ai 수집 ${usage.collected_on})` : ''}`;
   if (usage.state === 'stale') return `실제 사용: 사용 기록 오래됨 (kch-ai 수집 ${usage.collected_on})`;
-  return `실제 사용: 최근 30일 ${usage.count_30 ?? 0}회 · 마지막 ${usage.last_used ? usageDay(usage.last_used) : '최근 90일 없음'} (kch-ai 수집 ${usage.collected_on})`;
+  const months = usage.months || [];
+  const steady = months.length < 2 ? '' : usage.missing_months?.length ? ` · 빠진 달 ${usage.missing_months.map(monthName).join(', ')}` : usage.steady ? ` · ${monthName(months[0].month)}부터 매달 사용` : '';
+  return `실제 사용: 최근 30일 ${usage.count_30 ?? 0}회 · 마지막 ${usage.last_used ? usageDay(usage.last_used) : '기록 없음'}${steady} (kch-ai 수집 ${usage.collected_on})${months.length ? `\n  월별: ${monthsLine(months)}` : ''}`;
 };
 
 async function staffOf(projectId) {
@@ -1284,14 +1316,14 @@ async function opApply(options) {
       }
     }
   }
-  // 사용 기록 (1.8.0): read the run records (never run the program) and send dates and counts only.
+  // 사용 기록 (1.8.0, 1.9.0 since 9월): read the run records (never run the program) and send dates and counts only.
   let usageResult = null;
   if (sheet.usageSection) {
     const usageNow = project ? await authed('GET', `/projects/${encodeURIComponent(project.id)}/usage`).catch(() => null) : null;
     const today = kstDayOf(new Date());
     let collected = null;
     // A broken 사용 기록 line must not stop the rest of apply: it is reported and nothing is sent for it.
-    try { collected = collectUsage(sheet.usageSources, sheet.usageRule, baseDir, { registeredOn: usageNow?.registered_on || today, today }); }
+    try { collected = collectUsage(sheet.usageSources, sheet.usageRule, baseDir, { registeredOn: usageNow?.registered_on || today, windowFrom: usageNow?.window_from, today }); }
     catch (error) { if (!(error instanceof UserError)) throw error; plan.push(`참고: 사용 기록은 보내지 않았습니다. ${error.message}`); }
     if (collected && !sameUsage(usageNow?.latest, collected.body, today)) {
       usageResult = collected;
@@ -1920,12 +1952,12 @@ async function opUsage(options) {
   if (!project) throw new UserError('이 정리 문서의 프로젝트가 아직 현황관리에 없습니다. 먼저 apply 로 등록해 주세요.');
   const now = await authed('GET', `/projects/${encodeURIComponent(project.id)}/usage`);
   const today = kstDayOf(new Date());
-  const result = collectUsage(sheet.usageSources, sheet.usageRule, baseDir, { registeredOn: now?.registered_on || today, today });
+  const result = collectUsage(sheet.usageSources, sheet.usageRule, baseDir, { registeredOn: now?.registered_on || today, windowFrom: now?.window_from, today });
   if (sameUsage(now?.latest, result.body, today)) return `${project.title}: 오늘 이미 같은 기록을 보냈습니다. 바꿀 것이 없습니다.\n${usageResultText(now.usage)}`;
   await confirm(`${project.title}: 실행 기록을 읽어 날짜와 개수만 보냅니다 (프로그램은 실행하지 않음, 내용은 안 보냄).\n- ${usagePlanLine(result)}`, options);
   const sent = await authed('PUT', `/projects/${encodeURIComponent(project.id)}/usage`, { body: result.body });
   rememberUsageSources(project.id, sheet.usageSources, sheet.usageRule);
-  return `${project.title}: ${usageResultText(sent?.usage)}${sent?.dropped_days ? `\n참고: 등록일 이전이거나 앞으로의 날짜 ${sent.dropped_days}일은 현황관리가 뺍습니다.` : ''}`;
+  return `${project.title}: ${usageResultText(sent?.usage)}${sent?.dropped_days ? `\n참고: 앞으로의 날짜이거나 너무 오래된 날짜 ${sent.dropped_days}일은 현황관리가 뺍습니다.` : ''}`;
 }
 
 /** kch-ai pack: send this folder's code privately so the judgment can read it without GitHub. */
